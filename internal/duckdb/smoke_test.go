@@ -1,3 +1,5 @@
+//go:build !(windows && arm64)
+
 package duckdb
 
 import (
@@ -6,12 +8,11 @@ import (
 	"path/filepath"
 	"testing"
 
-	_ "github.com/duckdb/duckdb-go/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-const duckDBGoModuleVersion = "v2.10503.1"
+const duckDBGoModuleVersion = "v2.10504.0"
 
 func TestLocalFileSmoke(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "agentsview.duckdb")

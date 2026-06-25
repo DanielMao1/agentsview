@@ -13,6 +13,7 @@ import {
   configureGeneratedClient,
   isRemoteConnection,
 } from "../api/runtime.js";
+import { events } from "./events.svelte.js";
 import type {
   SyncProgress,
   SyncStats,
@@ -84,6 +85,7 @@ class SyncStore {
   private syncCompleteListeners: SyncCompleteListener[] = [];
   private statusHydrated = false;
   private pendingHydration = false;
+  private statusProgressActive = false;
 
   /** Register a callback invoked after any sync completes. */
   onSyncComplete(listener: SyncCompleteListener) {
@@ -139,6 +141,9 @@ class SyncStore {
       configureGeneratedClient();
       const status = await SyncService.getApiV1SyncStatus();
       this.markRemoteReachable(true);
+      if (this.serverVersion === null) {
+        await this.loadVersion({ updateBackendHealth: false });
+      }
       const newLastSync = status.last_sync || null;
       const isInitial = !this.statusHydrated;
       this.statusHydrated = true;
@@ -146,11 +151,30 @@ class SyncStore {
         newLastSync !== null && newLastSync !== this.lastSync;
       this.lastSync = newLastSync;
       this.lastSyncStats = status.stats as unknown as SyncStats | null;
+      const statusProgress =
+        (status as unknown as { progress?: SyncProgress | null })
+          .progress ?? null;
+      let statusProgressCompleted = false;
+      if (statusProgress) {
+        this.statusProgressActive = true;
+        this.syncing = true;
+        this.progress = statusProgress;
+      } else if (this.statusProgressActive) {
+        this.statusProgressActive = false;
+        this.syncing = false;
+        this.progress = null;
+        statusProgressCompleted = true;
+      }
       const shouldRetryStats = this.backendDegraded;
       // Suppress notifications on initial hydration and
       // when a local sync just completed (pendingHydration).
       if (this.pendingHydration) {
         this.pendingHydration = false;
+      } else if (statusProgress) {
+        return;
+      } else if (statusProgressCompleted) {
+        await this.loadStats();
+        this.notifySyncComplete();
       } else if (changed && !isInitial) {
         await this.loadStats();
         this.notifySyncComplete();
@@ -206,18 +230,24 @@ class SyncStore {
     }
   }
 
-  async loadVersion() {
+  async loadVersion(
+    opts: { updateBackendHealth?: boolean } = {},
+  ) {
+    const updateBackendHealth = opts.updateBackendHealth ?? true;
     try {
       configureGeneratedClient();
       this.serverVersion =
         await MetadataService.getApiV1Version() as VersionInfo;
+      events.setAvailable(this.serverVersion.read_only !== true);
       this.markRemoteReachable(true);
       this.versionMismatch = commitsDisagree(
         this.buildCommit,
         this.serverVersion.commit,
       );
     } catch (error) {
-      this.markBackendFailure(error);
+      if (updateBackendHealth) {
+        this.markBackendFailure(error);
+      }
       console.warn("Failed to load version info:", error);
     }
   }
@@ -271,6 +301,7 @@ class SyncStore {
     if (this.syncing) return false;
     this.syncing = true;
     this.progress = null;
+    this.statusProgressActive = false;
     try {
       this.pendingHydration = true;
       await Promise.all([this.loadStatus(), this.loadStats()]);
@@ -293,6 +324,7 @@ class SyncStore {
     if (this.syncing) return false;
     this.syncing = true;
     this.progress = null;
+    this.statusProgressActive = false;
 
     const finalizeSync = () => {
       this.syncing = false;

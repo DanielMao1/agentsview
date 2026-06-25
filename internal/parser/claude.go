@@ -19,12 +19,13 @@ import (
 )
 
 var (
-	xmlTaskIDRe   = regexp.MustCompile(`<task-id>([^<]+)</task-id>`)
-	xmlToolUseRe  = regexp.MustCompile(`<tool-use-id>([^<]+)</tool-use-id>`)
-	xmlCmdNameRe  = regexp.MustCompile(`<command-name>([^<]+)</command-name>`)
-	xmlCmdMsgRe   = regexp.MustCompile(`<command-message>([^<]+)</command-message>`)
-	xmlCmdArgsRe  = regexp.MustCompile(`<command-args>([^<]*)</command-args>`)
-	xmlCmdStripRe = regexp.MustCompile(`<command-(?:name|message|args)>[^<]*</command-(?:name|message|args)>`)
+	xmlTaskIDRe               = regexp.MustCompile(`<task-id>([^<]+)</task-id>`)
+	xmlToolUseRe              = regexp.MustCompile(`<tool-use-id>([^<]+)</tool-use-id>`)
+	xmlCmdNameRe              = regexp.MustCompile(`<command-name>([^<]+)</command-name>`)
+	xmlCmdMsgRe               = regexp.MustCompile(`<command-message>([^<]+)</command-message>`)
+	xmlCmdArgsRe              = regexp.MustCompile(`<command-args>([^<]*)</command-args>`)
+	xmlCmdStripRe             = regexp.MustCompile(`<command-(?:name|message|args)>[^<]*</command-(?:name|message|args)>`)
+	persistedToolResultPathRe = regexp.MustCompile(`(?m)Full output saved to:\s*(.+)$`)
 )
 
 const (
@@ -109,6 +110,7 @@ func ParseClaudeSessionWithExclusions(
 		globalEnd       time.Time
 	)
 	allHaveUUID = true
+	parentSessionID = claudeCompanionParentSessionID(path, sessionID)
 
 	lr := newLineReader(f, maxLineSize)
 	lastLineFailed := false
@@ -123,6 +125,7 @@ func ParseClaudeSessionWithExclusions(
 			lastLineFailed = true
 			continue
 		}
+		line = resolveClaudePersistedToolResults(path, line)
 		lastLineFailed = false
 
 		entryType := gjson.Get(line, "type").Str
@@ -388,10 +391,12 @@ func ParseClaudeSessionFrom(
 	path string,
 	offset int64,
 	startOrdinal int,
+	lastEntryUUID string,
 ) ([]ParsedMessage, time.Time, int64, error) {
 	var (
 		entries        []dagEntry
 		queuedCommands []claudeQueuedCommand
+		subagentMap    = make(map[string]string)
 		lineIndex      = startOrdinal
 		// Track latest timestamp from all lines, including
 		// non-message events (progress, queue-operation) so
@@ -403,6 +408,7 @@ func ParseClaudeSessionFrom(
 
 	consumed, err := readJSONLFrom(
 		path, offset, func(line string) {
+			line = resolveClaudePersistedToolResults(path, line)
 			if ts := extractTimestamp(line); !ts.IsZero() {
 				if ts.After(latestTS) {
 					latestTS = ts
@@ -420,6 +426,37 @@ func ParseClaudeSessionFrom(
 			if entryType == "attachment" {
 				if qc, ok := extractQueuedCommand(line); ok {
 					queuedCommands = append(queuedCommands, qc)
+				}
+				return
+			}
+			if entryType == "queue-operation" {
+				if gjson.Get(line, "operation").Str == "enqueue" {
+					contentStr := gjson.Get(line, "content").Str
+					if contentStr != "" {
+						tuid := gjson.Get(contentStr, "tool_use_id").Str
+						taskID := gjson.Get(contentStr, "task_id").Str
+						if tuid == "" || taskID == "" {
+							if m := xmlTaskIDRe.FindStringSubmatch(contentStr); m != nil {
+								taskID = m[1]
+							}
+							if m := xmlToolUseRe.FindStringSubmatch(contentStr); m != nil {
+								tuid = m[1]
+							}
+						}
+						if tuid != "" && taskID != "" {
+							subagentMap[tuid] = "agent-" + taskID
+						}
+					}
+				}
+				return
+			}
+			if entryType == "progress" {
+				if gjson.Get(line, "data.type").Str == "agent_progress" {
+					tuid := gjson.Get(line, "parentToolUseID").Str
+					agentID := gjson.Get(line, "data.agentId").Str
+					if tuid != "" && agentID != "" {
+						subagentMap[tuid] = "agent-" + agentID
+					}
 				}
 				return
 			}
@@ -453,6 +490,13 @@ func ParseClaudeSessionFrom(
 		return nil, time.Time{}, 0, ErrClaudeIncrementalNeedsFullParse
 	}
 
+	// Queue/progress events can repair subagent linkage on an already-stored
+	// tool call. If the mapped tool_use_id is not introduced in this append,
+	// incremental parsing would advance file_size without updating that row.
+	if needsClaudeFullParseForSubagentMap(entries, subagentMap) {
+		return nil, time.Time{}, 0, ErrClaudeIncrementalNeedsFullParse
+	}
+
 	if len(entries) == 0 && len(queuedCommands) == 0 {
 		return nil, latestTS, consumed, nil
 	}
@@ -460,7 +504,7 @@ func ParseClaudeSessionFrom(
 	// Detect forks: if any entry's parentUuid doesn't
 	// match the previous entry's uuid, the appended data
 	// contains a branch that requires full DAG processing.
-	if hasDAGFork(entries) {
+	if hasDAGFork(entries, lastEntryUUID) {
 		return nil, time.Time{}, 0, ErrDAGDetected
 	}
 
@@ -476,6 +520,7 @@ func ParseClaudeSessionFrom(
 	msgs, _, endedAt := extractMessagesFrom(
 		entries, startOrdinal,
 	)
+	annotateSubagentSessions(msgs, subagentMap)
 	if len(queuedCommands) > 0 {
 		msgs = mergeQueuedCommands(
 			msgs, queuedCommands, startOrdinal,
@@ -501,17 +546,51 @@ func ParseClaudeSessionFrom(
 // same-message.id assistant run (whose chunks the full parser
 // merges into one message). Both cases require a full re-parse.
 func needsClaudeFullParse(entries []dagEntry) bool {
+	toolUseIDs := make(map[string]struct{})
 	var prevAssistantMID string
 	for _, e := range entries {
 		if e.entryType == "user" {
 			if gjson.Get(e.line, "toolUseResult.agentId").Str != "" {
 				return true
 			}
+			content := gjson.Get(e.line, "message.content")
+			if content.IsArray() {
+				unmatched := false
+				content.ForEach(func(_, part gjson.Result) bool {
+					if part.Get("type").Str != "tool_result" {
+						return true
+					}
+					toolUseID := part.Get("tool_use_id").Str
+					if toolUseID == "" {
+						return true
+					}
+					if _, ok := toolUseIDs[toolUseID]; !ok {
+						unmatched = true
+						return false
+					}
+					return true
+				})
+				if unmatched {
+					return true
+				}
+			}
 		}
 		if e.entryType == "assistant" {
 			mid := gjson.Get(e.line, "message.id").Str
 			if mid != "" && mid == prevAssistantMID {
 				return true
+			}
+			content := gjson.Get(e.line, "message.content")
+			if content.IsArray() {
+				content.ForEach(func(_, part gjson.Result) bool {
+					if part.Get("type").Str != "tool_use" {
+						return true
+					}
+					if toolUseID := part.Get("id").Str; toolUseID != "" {
+						toolUseIDs[toolUseID] = struct{}{}
+					}
+					return true
+				})
 			}
 			prevAssistantMID = mid
 			continue
@@ -521,13 +600,48 @@ func needsClaudeFullParse(entries []dagEntry) bool {
 	return false
 }
 
+func needsClaudeFullParseForSubagentMap(
+	entries []dagEntry, subagentMap map[string]string,
+) bool {
+	if len(subagentMap) == 0 {
+		return false
+	}
+
+	appendedToolUseIDs := make(map[string]struct{})
+	for _, e := range entries {
+		if e.entryType != "assistant" {
+			continue
+		}
+		content := gjson.Get(e.line, "message.content")
+		if !content.IsArray() {
+			continue
+		}
+		content.ForEach(func(_, part gjson.Result) bool {
+			if part.Get("type").Str != "tool_use" {
+				return true
+			}
+			if toolUseID := part.Get("id").Str; toolUseID != "" {
+				appendedToolUseIDs[toolUseID] = struct{}{}
+			}
+			return true
+		})
+	}
+
+	for toolUseID := range subagentMap {
+		if _, ok := appendedToolUseIDs[toolUseID]; !ok {
+			return true
+		}
+	}
+	return false
+}
+
 // hasDAGFork returns true if the entries contain a fork —
 // i.e. any entry whose parentUuid doesn't point to the
 // immediately preceding entry's uuid. Linear UUID chains
 // (each entry parenting the next) are safe for incremental
 // parsing; forks require full DAG processing.
-func hasDAGFork(entries []dagEntry) bool {
-	var lastUUID string
+func hasDAGFork(entries []dagEntry, lastEntryUUID string) bool {
+	lastUUID := lastEntryUUID
 	for _, e := range entries {
 		if e.uuid == "" {
 			continue // non-UUID entries are always linear
@@ -1274,6 +1388,181 @@ func replaceClaudeMessageContent(line string, blocks []gjson.Result) string {
 		return line
 	}
 	return string(encoded)
+}
+
+func claudeCompanionParentSessionID(path, sessionID string) string {
+	if !strings.HasPrefix(sessionID, "agent-") {
+		return ""
+	}
+	parts := splitCleanPath(path)
+	for i, part := range parts {
+		if part != "subagents" || i == 0 {
+			continue
+		}
+		parent := parts[i-1]
+		if parent != "" {
+			return parent
+		}
+	}
+	return ""
+}
+
+func splitCleanPath(path string) []string {
+	clean := filepath.Clean(path)
+	var parts []string
+	for {
+		dir, file := filepath.Split(clean)
+		if file != "" {
+			parts = append(parts, file)
+		}
+		next := filepath.Clean(strings.TrimSuffix(dir, string(filepath.Separator)))
+		if next == clean || next == "." || next == string(filepath.Separator) || next == "" {
+			break
+		}
+		clean = next
+	}
+	slices.Reverse(parts)
+	return parts
+}
+
+func resolveClaudePersistedToolResults(sessionPath, line string) string {
+	if !strings.Contains(line, "persisted-output") &&
+		!strings.Contains(line, "persistedOutputPath") {
+		return line
+	}
+
+	dec := json.NewDecoder(strings.NewReader(line))
+	dec.UseNumber()
+	var top map[string]any
+	if err := dec.Decode(&top); err != nil {
+		return line
+	}
+
+	msg, ok := top["message"].(map[string]any)
+	if !ok {
+		return line
+	}
+	blocks, ok := msg["content"].([]any)
+	if !ok {
+		return line
+	}
+
+	persistedPath := ""
+	if tur, ok := top["toolUseResult"].(map[string]any); ok {
+		if p, ok := tur["persistedOutputPath"].(string); ok {
+			persistedPath = p
+		}
+	}
+	toolResultCount := countClaudeToolResultBlocks(blocks)
+
+	changed := false
+	for _, rawBlock := range blocks {
+		block, ok := rawBlock.(map[string]any)
+		if !ok || block["type"] != "tool_result" {
+			continue
+		}
+		content, ok := block["content"].(string)
+		if !ok {
+			continue
+		}
+		path := persistedOutputPathFromContent(content)
+		if path == "" && (toolResultCount == 1 ||
+			isPersistedToolResultPlaceholder(content)) {
+			path = persistedPath
+		}
+		if path == "" {
+			continue
+		}
+		output, ok := readClaudePersistedToolResult(sessionPath, path)
+		if !ok {
+			continue
+		}
+		block["content"] = output
+		changed = true
+	}
+	if !changed {
+		return line
+	}
+
+	encoded, err := json.Marshal(top)
+	if err != nil {
+		return line
+	}
+	return string(encoded)
+}
+
+func countClaudeToolResultBlocks(blocks []any) int {
+	count := 0
+	for _, rawBlock := range blocks {
+		block, ok := rawBlock.(map[string]any)
+		if ok && block["type"] == "tool_result" {
+			count++
+		}
+	}
+	return count
+}
+
+func isPersistedToolResultPlaceholder(content string) bool {
+	return strings.Contains(content, "<persisted-output>")
+}
+
+func persistedOutputPathFromContent(content string) string {
+	match := persistedToolResultPathRe.FindStringSubmatch(content)
+	if len(match) != 2 {
+		return ""
+	}
+	return strings.TrimSpace(match[1])
+}
+
+func readClaudePersistedToolResult(
+	sessionPath, resultPath string,
+) (string, bool) {
+	if resultPath == "" {
+		return "", false
+	}
+	if !filepath.IsAbs(resultPath) {
+		return "", false
+	}
+	cleanResult := filepath.Clean(resultPath)
+	for _, dir := range claudeToolResultDirs(sessionPath) {
+		if !pathWithinDir(cleanResult, dir) {
+			continue
+		}
+		b, err := os.ReadFile(cleanResult)
+		if err != nil {
+			return "", false
+		}
+		return string(b), true
+	}
+	return "", false
+}
+
+func claudeToolResultDirs(sessionPath string) []string {
+	var dirs []string
+	sessionDir := filepath.Join(
+		filepath.Dir(sessionPath),
+		strings.TrimSuffix(filepath.Base(sessionPath), ".jsonl"),
+		"tool-results",
+	)
+	dirs = append(dirs, filepath.Clean(sessionDir))
+
+	clean := filepath.Clean(sessionPath)
+	needle := string(filepath.Separator) + "subagents" + string(filepath.Separator)
+	if idx := strings.Index(clean, needle); idx > 0 {
+		dirs = append(dirs, filepath.Join(clean[:idx], "tool-results"))
+	}
+	return dirs
+}
+
+func pathWithinDir(path, dir string) bool {
+	rel, err := filepath.Rel(dir, path)
+	if err != nil {
+		return false
+	}
+	return rel != "." &&
+		rel != "" &&
+		!strings.HasPrefix(rel, ".."+string(filepath.Separator)) &&
+		rel != ".."
 }
 
 // countUserTurns counts all user entries reachable from a

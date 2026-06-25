@@ -141,12 +141,31 @@ func (d *DB) CopyOrphanedDataFromExcluding(
 	// Snapshot orphaned session IDs before any inserts
 	// change main.sessions. Exclude permanently deleted sessions
 	// so they are not resurrected as orphans.
+	//
+	// Also exclude stale Codex rows whose file was reparsed into
+	// the new DB under a different session id: before dataVersion
+	// 40 a forked rollout's replayed parent session_meta overwrote
+	// the fork's id (#643), so the fork file's row was stored under
+	// the parent's identity with double-counted totals. That row is
+	// a stale duplicate of a live file, not an archive of a lost
+	// one. Scoped to Codex because it is strictly one session per
+	// file; SQLite-backed agents share a file_path across many
+	// sessions, where an id missing from the fresh parse can be a
+	// genuinely evicted chat that must survive as an orphan.
 	if _, err := conn.ExecContext(ctx, `
 		CREATE TEMP TABLE _orphaned_ids AS
 		SELECT id FROM old_db.sessions
 		WHERE id NOT IN (SELECT id FROM main.sessions)
 		  AND id NOT IN (SELECT id FROM main.excluded_sessions)
-		  AND id NOT IN (SELECT id FROM _extra_excluded_orphan_ids)`,
+		  AND id NOT IN (SELECT id FROM _extra_excluded_orphan_ids)
+		  AND id NOT IN (
+			SELECT old_s.id
+			FROM old_db.sessions old_s
+			JOIN main.sessions new_s
+				ON new_s.file_path = old_s.file_path
+			WHERE old_s.agent = 'codex'
+			  AND new_s.agent = 'codex'
+		  )`,
 	); err != nil {
 		return 0, fmt.Errorf(
 			"identifying orphaned sessions: %w", err,
@@ -280,6 +299,51 @@ func (d *DB) CopyTrashedDataFrom(sourcePath string) (int, error) {
 	return count, nil
 }
 
+// CopySyncStateFrom copies pg_sync_state rows from the source database into the
+// current database. ResyncAll uses this to preserve durable local sync metadata
+// such as the PG push owner marker across the temp-DB swap.
+func (d *DB) CopySyncStateFrom(sourcePath string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	ctx := context.Background()
+	conn, err := d.getWriter().Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquiring connection: %w", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.ExecContext(
+		ctx, "ATTACH DATABASE ? AS old_db", sourcePath,
+	); err != nil {
+		return fmt.Errorf("attaching source db: %w", err)
+	}
+	defer func() {
+		_, _ = execWithoutCancel(ctx, conn, "DETACH DATABASE old_db")
+	}()
+
+	// Older databases may have no pg_sync_state table.
+	var tableExists int
+	err = conn.QueryRowContext(
+		ctx, "SELECT 1 FROM old_db.sqlite_master WHERE type='table' AND name='pg_sync_state'",
+	).Scan(&tableExists)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return fmt.Errorf("probing pg_sync_state table: %w", err)
+	}
+
+	_, err = conn.ExecContext(ctx, `
+		INSERT OR REPLACE INTO main.pg_sync_state (key, value)
+		SELECT key, value FROM old_db.pg_sync_state
+		WHERE key = 'pg_push_marker_id'`)
+	if err != nil {
+		return fmt.Errorf("copying sync state: %w", err)
+	}
+	return nil
+}
+
 // CopyExcludedSessionsFrom copies the excluded_sessions table
 // from the source DB so permanently deleted sessions survive
 // full DB rebuilds. The source must not have active connections.
@@ -318,9 +382,6 @@ func (d *DB) CopyExcludedSessionsFrom(
 			return nil
 		}
 		return fmt.Errorf("probing excluded_sessions table: %w", err)
-	}
-	if tableExists != 1 {
-		return nil
 	}
 
 	_, err = conn.ExecContext(ctx, `
@@ -446,6 +507,31 @@ func (d *DB) CopySessionMetadataFrom(
 		}
 	}
 
+	if oldDBHasTable(ctx, tx, "cursor_usage_events") {
+		if _, err := tx.ExecContext(ctx, `
+			DELETE FROM main.cursor_usage_events`); err != nil {
+			return fmt.Errorf("clearing cursor usage events: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO main.cursor_usage_events (
+				occurred_at, model, kind,
+				input_tokens, output_tokens,
+				cache_write_tokens, cache_read_tokens,
+				charged_cents, cursor_token_fee,
+				user_id, user_email, is_headless, dedup_key
+			)
+			SELECT
+				occurred_at, model, kind,
+				input_tokens, output_tokens,
+				cache_write_tokens, cache_read_tokens,
+				charged_cents, cursor_token_fee,
+				user_id, user_email, is_headless, dedup_key
+			FROM old_db.cursor_usage_events
+			ORDER BY occurred_at, id`); err != nil {
+			return fmt.Errorf("copying cursor usage events: %w", err)
+		}
+	}
+
 	// Copy persistent worktree project mappings. Omit id so
 	// primary-key values from old_db cannot shadow existing
 	// destination rows. ResyncAll may pre-copy mappings into
@@ -530,6 +616,12 @@ func orphanSessionCols(ctx context.Context, tx *sql.Tx) string {
 		"context_pressure_max", "health_score",
 		"health_grade", "has_tool_calls",
 		"has_context_data", "data_version",
+		"quality_signal_version", "short_prompt_count",
+		"unstructured_start",
+		"missing_success_criteria_count",
+		"missing_verification_count",
+		"duplicate_prompt_count", "no_code_context_count",
+		"runaway_tool_loop_count",
 		"cwd", "git_branch", "source_session_id",
 		"source_version", "parser_malformed_lines",
 		"is_truncated",
@@ -611,6 +703,20 @@ func copySessionDataForIDs(
 	}
 	toolCallCols = append(toolCallCols, "subagent_session_id")
 	toolCallSelect = append(toolCallSelect, "otc.subagent_session_id")
+	if oldDBHasColumn(ctx, tx, "tool_calls", "file_path") {
+		toolCallCols = append(toolCallCols, "file_path")
+		toolCallSelect = append(toolCallSelect, "otc.file_path")
+	} else {
+		toolCallCols = append(toolCallCols, "file_path")
+		toolCallSelect = append(toolCallSelect, "NULL")
+	}
+	if oldDBHasColumn(ctx, tx, "tool_calls", "call_index") {
+		toolCallCols = append(toolCallCols, "call_index")
+		toolCallSelect = append(toolCallSelect, "otc.call_index")
+	} else {
+		toolCallCols = append(toolCallCols, "call_index")
+		toolCallSelect = append(toolCallSelect, "NULL")
+	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO tool_calls
 			(`+strings.Join(toolCallCols, ", ")+`)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -20,6 +21,36 @@ const (
 	groupUsage = "usage"
 	groupMeta  = "meta"
 )
+
+const dataVersionTooNewExitCode = 3
+
+type cliExitError struct {
+	code int
+	err  error
+}
+
+func (e *cliExitError) Error() string {
+	return e.err.Error()
+}
+
+func (e *cliExitError) Unwrap() error {
+	return e.err
+}
+
+func withExitCode(err error, code int) error {
+	if err == nil {
+		return nil
+	}
+	return &cliExitError{code: code, err: err}
+}
+
+func exitCodeFromError(err error) int {
+	var exitErr *cliExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.code
+	}
+	return 1
+}
 
 func newRootCommand() *cobra.Command {
 	var showVersion bool
@@ -64,12 +95,16 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(newProjectsCommand())
 	root.AddCommand(newHealthCommand())
 	root.AddCommand(newUsageCommand())
+	root.AddCommand(newActivityCommand())
 	root.AddCommand(newPGCommand())
 	root.AddCommand(newDuckDBCommand())
 	root.AddCommand(newSessionCommand())
+	root.AddCommand(newMCPCommand())
 	root.AddCommand(newStatsCommand())
+	root.AddCommand(newParseDiffCommand())
 	root.AddCommand(newClassifierCommand())
 	root.AddCommand(newSecretsCommand())
+	root.AddCommand(newDoctorCommand())
 	root.AddCommand(newVersionCommand())
 	root.AddCommand(newOpenAPICommand())
 
@@ -86,18 +121,82 @@ func newRootCommand() *cobra.Command {
 }
 
 func newServeCommand() *cobra.Command {
+	var background bool
+	var checkDataVersion bool
 	cmd := &cobra.Command{
 		Use:          "serve",
 		Short:        "Start server",
 		GroupID:      groupCore,
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
-		Run: func(cmd *cobra.Command, args []string) {
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if checkDataVersion {
+				cfg, err := config.LoadReadOnly()
+				if err != nil {
+					return err
+				}
+				return runServeDataVersionCheck(cfg)
+			}
+			if background {
+				// Acquire the launch lock before loading config; config
+				// loading writes config.toml and must be single-writer
+				// across concurrent launches.
+				runServeBackgroundCommand(cmd)
+				return nil
+			}
 			runServe(mustLoadConfig(cmd))
+			return nil
 		},
 	}
+	cmd.Flags().BoolVar(
+		&background,
+		"background",
+		false,
+		"Start server in the background and return to the shell",
+	)
+	cmd.Flags().BoolVar(
+		&checkDataVersion,
+		"check-data-version",
+		false,
+		"Check whether the configured database is compatible with this binary",
+	)
+	_ = cmd.Flags().MarkHidden("check-data-version")
 	config.RegisterServePFlags(cmd.Flags())
+	cmd.AddCommand(newServeStatusCommand())
+	cmd.AddCommand(newServeStopCommand())
 	return cmd
+}
+
+func runServeDataVersionCheck(cfg config.Config) error {
+	err := db.CheckDataVersion(cfg.DBPath)
+	if db.IsDataVersionTooNew(err) {
+		return withExitCode(err, dataVersionTooNewExitCode)
+	}
+	return err
+}
+
+func newServeStatusCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:          "status",
+		Short:        "Show whether a server is running and where to reach it",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		Run: func(cmd *cobra.Command, args []string) {
+			runServeStatus(mustLoadConfig(cmd))
+		},
+	}
+}
+
+func newServeStopCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:          "stop",
+		Short:        "Stop the running server",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		Run: func(cmd *cobra.Command, args []string) {
+			runServeStop(mustLoadConfig(cmd))
+		},
+	}
 }
 
 func newOpenAPICommand() *cobra.Command {
@@ -328,6 +427,7 @@ func newUsageCommand() *cobra.Command {
 	}
 	cmd.AddCommand(newUsageDailyCommand())
 	cmd.AddCommand(newUsageStatuslineCommand())
+	cmd.AddCommand(newUsageCursorCommand())
 	return cmd
 }
 
@@ -371,6 +471,47 @@ func newUsageStatuslineCommand() *cobra.Command {
 	return cmd
 }
 
+func newActivityCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:          "activity",
+		Short:        "Activity and concurrency reporting",
+		GroupID:      groupUsage,
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return cmd.Help()
+		},
+	}
+	cmd.AddCommand(newActivityReportCommand())
+	return cmd
+}
+
+func newActivityReportCommand() *cobra.Command {
+	var cfg ActivityReportConfig
+	cmd := &cobra.Command{
+		Use:          "report",
+		Short:        "Activity report over a date range",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		Run: func(cmd *cobra.Command, args []string) {
+			runActivityReport(cfg)
+		},
+	}
+	cmd.Flags().StringVar(&cfg.Preset, "preset", "", "Range preset: day, week, month, custom")
+	cmd.Flags().StringVar(&cfg.Date, "date", "", "Anchor date for presets (YYYY-MM-DD)")
+	cmd.Flags().StringVar(&cfg.From, "from", "", "Start instant for custom range (RFC3339)")
+	cmd.Flags().StringVar(&cfg.To, "to", "", "End instant for custom range (RFC3339)")
+	cmd.Flags().StringVar(&cfg.Timezone, "timezone", "", "IANA timezone for range bucketing")
+	cmd.Flags().StringVar(&cfg.Bucket, "bucket", "", "Bucket size: 5m, 15m, 1h, 1d, 1w")
+	cmd.Flags().StringVar(&cfg.Project, "project", "", "Filter by project")
+	cmd.Flags().StringVar(&cfg.Agent, "agent", "", "Filter by agent name")
+	cmd.Flags().StringVar(&cfg.Machine, "machine", "", "Filter by machine name")
+	cmd.Flags().BoolVar(&cfg.JSON, "json", false, "Output as JSON")
+	cmd.Flags().BoolVar(&cfg.NoSync, "no-sync", false, "Skip on-demand sync before querying")
+	cmd.Flags().BoolVar(&cfg.Offline, "offline", false, "Use fallback pricing only")
+	return cmd
+}
+
 func newPGCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:          "pg",
@@ -392,22 +533,40 @@ func newPGCommand() *cobra.Command {
 func newPGPushCommand() *cobra.Command {
 	var cfg PGPushConfig
 	cmd := &cobra.Command{
-		Use:          "push",
+		Use:          "push [target]",
 		Short:        "Push local data to PostgreSQL",
 		SilenceUsage: true,
-		Args:         cobra.NoArgs,
-		Run: func(cmd *cobra.Command, args []string) {
+		Args:         cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			targetName := ""
+			if len(args) == 1 {
+				targetName = args[0]
+			}
+			if cfg.AllTargets && cfg.Watch {
+				return fmt.Errorf(
+					"pg push --watch: %w",
+					fmt.Errorf(
+						"--all cannot be combined with --watch",
+					),
+				)
+			}
 			if cfg.Watch {
-				runPGPushWatch(cfg)
-				return
+				if err := runPGPushWatch(cfg, targetName); err != nil {
+					return fmt.Errorf("pg push --watch: %w", err)
+				}
+				return nil
 			}
 			if cmd.Flags().Changed("debounce") || cmd.Flags().Changed("interval") {
 				fmt.Fprintln(os.Stderr,
 					"warning: --debounce and --interval have no effect without --watch")
 			}
-			runPGPush(cfg)
+			if err := runPGPush(cfg, targetName); err != nil {
+				return fmt.Errorf("pg push: %w", err)
+			}
+			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&cfg.AllTargets, "all", false, "Push every configured PG target sequentially")
 	cmd.Flags().BoolVar(&cfg.Full, "full", false, "Force full local resync and PG push")
 	cmd.Flags().StringVar(&cfg.ProjectsFlag, "projects", "", "Comma-separated list of projects to push (inclusive)")
 	cmd.Flags().StringVar(&cfg.ExcludeProjects, "exclude-projects", "", "Comma-separated list of projects to exclude from push")
@@ -419,15 +578,25 @@ func newPGPushCommand() *cobra.Command {
 }
 
 func newPGStatusCommand() *cobra.Command {
-	return &cobra.Command{
-		Use:          "status",
+	var allTargets bool
+	cmd := &cobra.Command{
+		Use:          "status [target]",
 		Short:        "Show PG sync status",
 		SilenceUsage: true,
-		Args:         cobra.NoArgs,
-		Run: func(cmd *cobra.Command, args []string) {
-			runPGStatus()
+		Args:         cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			targetName := ""
+			if len(args) == 1 {
+				targetName = args[0]
+			}
+			if err := runPGStatus(targetName, allTargets); err != nil {
+				return fmt.Errorf("pg status: %w", err)
+			}
+			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&allTargets, "all", false, "Show status for every configured PG target")
+	return cmd
 }
 
 func newPGServeCommand() *cobra.Command {
@@ -610,6 +779,10 @@ func writeRootHelp(w io.Writer, root *cobra.Command) {
 	fmt.Fprintln(w, "  AMP_DIR                 Amp threads directory")
 	fmt.Fprintln(w, "  ZED_DIR                 Zed data directory")
 	fmt.Fprintln(w, "  QWEN_PROJECTS_DIR       Qwen Code projects directory")
+	fmt.Fprintln(w, "  QWENPAW_DIR             QwenPaw workspaces directory")
+	fmt.Fprintln(w, "  OMP_DIR                 OhMyPi sessions directory")
+	fmt.Fprintln(w, "  DEEPSEEK_TUI_SESSIONS_DIR")
+	fmt.Fprintln(w, "                          DeepSeek TUI sessions directory")
 	fmt.Fprintln(w, "  QCLAW_DIR               QClaw agents directory")
 	fmt.Fprintln(w, "  WORKBUDDY_PROJECTS_DIR  WorkBuddy projects directory")
 	fmt.Fprintln(w, "  PIEBALD_DIR             Piebald data directory")

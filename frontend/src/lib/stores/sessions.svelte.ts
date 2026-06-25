@@ -3,7 +3,10 @@ import {
   MetadataService,
   SessionsService,
 } from "../api/generated/index";
-import { configureGeneratedClient } from "../api/runtime.js";
+import {
+  callGenerated,
+  configureGeneratedClient,
+} from "../api/runtime.js";
 import type {
   Session,
   ProjectInfo,
@@ -13,18 +16,27 @@ import type {
 } from "../api/types.js";
 import { sync } from "./sync.svelte.js";
 import { events } from "./events.svelte.js";
+import { starred } from "./starred.svelte.js";
+import { yokedDates } from "./yokedDates.svelte.js";
 
-type SessionListParams = Parameters<
-  typeof SessionsService.getApiV1Sessions
+type SidebarIndexParams = Parameters<
+  typeof SessionsService.getApiV1SessionsSidebarIndex
 >[0];
 type MetadataParams = Parameters<
   typeof MetadataService.getApiV1Projects
 >[0];
+type ClearSessionFiltersOptions = {
+  clearDateYoke?: boolean;
+};
+type LoadOptions = {
+  force?: boolean;
+};
 
 const SESSION_PAGE_SIZE = 500;
 const SIDEBAR_HYDRATION_CONCURRENCY = 6;
 const LIVE_REFRESH_DEBOUNCE_MS = 300;
 const SAFETY_NET_REFRESH_MS = 5 * 60 * 1000;
+const RECENTLY_DELETED_TTL_MS = 10_000;
 
 export interface SessionGroupInput {
   id: string;
@@ -58,6 +70,12 @@ export interface SessionGroup {
   firstMessage: string | null;
   startedAt: string | null;
   endedAt: string | null;
+}
+
+export interface RecentlyDeletedSessions {
+  key: number;
+  ids: string[];
+  timer: ReturnType<typeof setTimeout>;
 }
 
 export interface Filters {
@@ -142,6 +160,10 @@ export function filtersToParams(
   if (!f.includeOneShot) p["include_one_shot"] = "false";
   if (f.includeAutomated) p["include_automated"] = "true";
   return p;
+}
+
+function hasDateFilters(f: Filters): boolean {
+  return !!(f.date || f.dateFrom || f.dateTo);
 }
 
 export function splitExcludeProjectParam(
@@ -252,6 +274,10 @@ class SessionsStore {
   private sidebarHydrationEpochByVersion = new Map<number, number>();
   private sidebarHydrationQueue: Array<() => void> = [];
   private sidebarHydrationActive = 0;
+  private sidebarConsumers = 0;
+  private sidebarLoadPromise: Promise<void> | null = null;
+  private sidebarLoadSignature: string | null = null;
+  private sidebarAbort: AbortController | null = null;
 
   private liveRefreshStarted = false;
   private unsubEvents: (() => void) | null = null;
@@ -267,7 +293,7 @@ class SessionsStore {
     return buildSessionGroups(this.sessions);
   }
 
-  private get apiParams(): SessionListParams {
+  private get apiParams(): SidebarIndexParams {
     const f = this.filters;
     // Don't exclude "unknown" when explicitly viewing it.
     const exclude =
@@ -296,6 +322,7 @@ class SessionsStore {
         f.minUserMessages > 0 ? f.minUserMessages : undefined,
       includeOneShot: f.includeOneShot || undefined,
       includeAutomated: f.includeAutomated || undefined,
+      starred: starred.filterOnly || undefined,
     };
   }
 
@@ -303,6 +330,20 @@ class SessionsStore {
     this.sessions = [];
     this.nextCursor = null;
     this.total = 0;
+  }
+
+  attachSidebar(): () => void {
+    this.sidebarConsumers++;
+    this.startLiveRefresh();
+    let detached = false;
+    return () => {
+      if (detached) return;
+      detached = true;
+      this.sidebarConsumers = Math.max(0, this.sidebarConsumers - 1);
+      if (this.sidebarConsumers === 0) {
+        this.dispose();
+      }
+    };
   }
 
   initFromParams(params: Record<string, string>) {
@@ -317,9 +358,50 @@ class SessionsStore {
     this.setActiveSession(null);
   }
 
-  async load() {
+  async load(options: LoadOptions = {}) {
     saveFilters(this.filters);
-    this.startLiveRefresh();
+
+    const params = {
+      ...this.apiParams,
+      limit: SESSION_PAGE_SIZE,
+    };
+    const signature = JSON.stringify(params);
+    if (
+      !options.force &&
+      this.sidebarLoadPromise !== null &&
+      this.sidebarLoadSignature === signature
+    ) {
+      return this.sidebarLoadPromise;
+    }
+
+    this.sidebarAbort?.abort();
+    const controller = new AbortController();
+    this.sidebarAbort = controller;
+    const promise = this.loadSidebarPage(params, controller.signal);
+    this.sidebarLoadPromise = promise;
+    this.sidebarLoadSignature = signature;
+    try {
+      await promise;
+    } finally {
+      if (this.sidebarLoadPromise === promise) {
+        this.sidebarLoadPromise = null;
+        this.sidebarLoadSignature = null;
+        if (this.sidebarAbort === controller) {
+          this.sidebarAbort = null;
+        }
+      }
+    }
+  }
+
+  refreshSidebarIfAttached() {
+    if (this.sidebarConsumers === 0) return;
+    void this.load();
+  }
+
+  private async loadSidebarPage(
+    params: SidebarIndexParams,
+    signal: AbortSignal,
+  ) {
     const version = ++this.loadVersion;
     const indexVersion = this.sidebarIndexVersion + 1;
     // Keep the existing list visible during reloads, but mark
@@ -335,9 +417,9 @@ class SessionsStore {
       total: this.total,
     };
     try {
-      configureGeneratedClient();
-      const index = await SessionsService.getApiV1SessionsSidebarIndex(
-        this.apiParams,
+      const index = await callGenerated(
+        () => SessionsService.getApiV1SessionsSidebarIndex(params),
+        signal,
       ) as unknown as SidebarSessionIndexResponse;
       if (this.loadVersion !== version) return;
 
@@ -345,11 +427,14 @@ class SessionsStore {
       this.hydratedSessionsByVersion.set(indexVersion, new Map());
       this.sidebarHydrationEpochByVersion.set(indexVersion, 0);
       this.pruneSidebarHydrationVersions(indexVersion);
-      const previousById = new Map(prev.sessions.map((s) => [s.id, s]));
+      const existing = new Map(this.sessions.map((session) => [
+        session.id,
+        session,
+      ]));
       this.sessions = index.sessions.map((row) =>
-        sidebarIndexRowToSession(row, previousById.get(row.id))
+        sidebarIndexRowToSession(row, existing.get(row.id))
       );
-      this.nextCursor = null;
+      this.nextCursor = index.next_cursor ?? null;
       this.total = index.total;
     } catch {
       // Restore previous state so a transient failure
@@ -479,19 +564,21 @@ class SessionsStore {
     this.loading = true;
     try {
       configureGeneratedClient();
-      const page = await SessionsService.getApiV1Sessions({
+      const index = await SessionsService.getApiV1SessionsSidebarIndex({
         ...this.apiParams,
         cursor: this.nextCursor,
         limit: SESSION_PAGE_SIZE,
-      }) as unknown as {
-        sessions: Session[];
-        next_cursor?: string | null;
-        total: number;
-      };
+      }) as unknown as SidebarSessionIndexResponse;
       if (this.loadVersion !== version) return;
-      this.sessions.push(...page.sessions);
-      this.nextCursor = page.next_cursor ?? null;
-      this.total = page.total;
+      this.sessions.push(
+        ...index.sessions.map((row) =>
+          sidebarIndexRowToSession(row, this.sessions.find(
+            (existing) => existing.id === row.id,
+          ))
+        ),
+      );
+      this.nextCursor = index.next_cursor ?? null;
+      this.total = index.total;
     } finally {
       if (this.loadVersion === version) {
         this.loading = false;
@@ -944,10 +1031,13 @@ class SessionsStore {
     );
   }
 
-  clearSessionFilters() {
+  clearSessionFilters(options: ClearSessionFiltersOptions = {}) {
     const project = this.filters.project;
     const wasOneShot = this.filters.includeOneShot;
     const wasAutomated = this.filters.includeAutomated;
+    if (options.clearDateYoke || hasDateFilters(this.filters)) {
+      yokedDates.clear();
+    }
     this.filters = { ...defaultFilters(), project };
     this.setActiveSession(null);
     if (wasOneShot !== this.filters.includeOneShot || wasAutomated) {
@@ -956,9 +1046,56 @@ class SessionsStore {
     this.load();
   }
 
-  /** Recently deleted session IDs for undo toast. */
-  recentlyDeleted: { id: string; timer: ReturnType<typeof setTimeout> }[] =
-    $state([]);
+  /** Recently deleted session batches for undo toast. */
+  recentlyDeleted: RecentlyDeletedSessions[] = $state([]);
+  private recentlyDeletedNextKey = 0;
+
+  private newRecentlyDeletedTimer(key: number) {
+    return setTimeout(() => {
+      this.recentlyDeleted = this.recentlyDeleted.filter(
+        (d) => d.key !== key,
+      );
+    }, RECENTLY_DELETED_TTL_MS);
+  }
+
+  private addRecentlyDeleted(ids: string[]) {
+    if (ids.length === 0) return;
+    const key = this.recentlyDeletedNextKey++;
+    const timer = this.newRecentlyDeletedTimer(key);
+    this.recentlyDeleted = [
+      ...this.recentlyDeleted,
+      { key, ids: [...ids], timer },
+    ];
+  }
+
+  /** Multi-select state for batch operations. */
+  selectedIds: Set<string> = $state(new Set());
+  selectMode: boolean = $state(false);
+
+  toggleSelectMode() {
+    this.selectMode = !this.selectMode;
+    if (!this.selectMode) {
+      this.selectedIds = new Set();
+    }
+  }
+
+  toggleSelection(id: string) {
+    const next = new Set(this.selectedIds);
+    if (next.has(id)) {
+      next.delete(id);
+    } else {
+      next.add(id);
+    }
+    this.selectedIds = next;
+  }
+
+  selectAll(ids: string[]) {
+    this.selectedIds = new Set(ids);
+  }
+
+  clearSelection() {
+    this.selectedIds = new Set();
+  }
 
   async deleteSession(id: string) {
     configureGeneratedClient();
@@ -972,13 +1109,25 @@ class SessionsStore {
     if (this.activeSessionId === id) {
       this.setActiveSession(null);
     }
-    const timer = setTimeout(() => {
-      this.recentlyDeleted = this.recentlyDeleted.filter(
-        (d) => d.id !== id,
-      );
-    }, 10_000);
-    this.recentlyDeleted = [...this.recentlyDeleted, { id, timer }];
+    this.addRecentlyDeleted([id]);
     this.invalidateFilterCaches();
+  }
+
+  async batchDeleteSessions(ids: string[]) {
+    if (ids.length === 0) return;
+    configureGeneratedClient();
+    await SessionsService.postApiV1SessionsBatchDelete({
+      requestBody: { session_ids: ids },
+    });
+    const idSet = new Set(ids);
+    if (this.activeSessionId && idSet.has(this.activeSessionId)) {
+      this.setActiveSession(null);
+    }
+    this.addRecentlyDeleted(ids);
+    this.selectedIds = new Set();
+    this.selectMode = false;
+    this.invalidateFilterCaches();
+    await this.load({ force: true });
   }
 
   async restoreSession(id: string) {
@@ -987,6 +1136,28 @@ class SessionsStore {
     this.clearRecentlyDeleted(id);
     this.invalidateFilterCaches();
     await this.load();
+  }
+
+  async restoreRecentlyDeleted(deleted: RecentlyDeletedSessions) {
+    const ids = [...deleted.ids];
+    if (ids.length === 0) return;
+    configureGeneratedClient();
+    clearTimeout(deleted.timer);
+    const failed: string[] = [];
+    for (const id of ids) {
+      try {
+        await SessionsService.postApiV1SessionsIdRestore({ id });
+      } catch {
+        failed.push(id);
+      }
+    }
+    this.updateRecentlyDeletedBatch(deleted, failed);
+    this.invalidateFilterCaches();
+    await this.load({ force: true });
+    if (failed.length > 0) {
+      const noun = failed.length === 1 ? "session" : "sessions";
+      throw new Error(`Failed to restore ${failed.length} ${noun}`);
+    }
   }
 
   private get metadataParams(): MetadataParams {
@@ -1015,17 +1186,39 @@ class SessionsStore {
   /** Remove one or all entries from the undo toast list. */
   clearRecentlyDeleted(id?: string) {
     if (id) {
-      this.recentlyDeleted = this.recentlyDeleted.filter((d) => {
-        if (d.id === id) {
+      this.recentlyDeleted = this.recentlyDeleted.flatMap((d) => {
+        if (!d.ids.includes(id)) return [d];
+        const ids = d.ids.filter((deletedId) => deletedId !== id);
+        if (ids.length === 0) {
           clearTimeout(d.timer);
-          return false;
+          return [];
         }
-        return true;
+        return [{ ...d, ids }];
       });
     } else {
       for (const d of this.recentlyDeleted) clearTimeout(d.timer);
       this.recentlyDeleted = [];
     }
+  }
+
+  private updateRecentlyDeletedBatch(
+    deleted: RecentlyDeletedSessions,
+    ids: string[],
+  ) {
+    this.recentlyDeleted = this.recentlyDeleted.flatMap((d) => {
+      if (d.key !== deleted.key) return [d];
+      if (ids.length === 0) {
+        clearTimeout(d.timer);
+        return [];
+      }
+      return [
+        {
+          ...d,
+          ids: [...ids],
+          timer: this.newRecentlyDeletedTimer(d.key),
+        },
+      ];
+    });
   }
 
   async renameSession(id: string, displayName: string | null) {
@@ -1071,6 +1264,7 @@ class SessionsStore {
   }
 
   private scheduleIndexRefresh() {
+    if (this.sidebarConsumers === 0) return;
     if (this.liveRefreshTimer !== null) {
       clearTimeout(this.liveRefreshTimer);
     }
@@ -1093,6 +1287,11 @@ class SessionsStore {
       clearInterval(this.safetyNetTimer);
       this.safetyNetTimer = null;
     }
+    this.sidebarAbort?.abort();
+    this.sidebarAbort = null;
+    this.sidebarLoadPromise = null;
+    this.sidebarLoadSignature = null;
+    this.loadVersion++;
     this.liveRefreshStarted = false;
   }
 }
@@ -1548,5 +1747,5 @@ export const sessions = createSessionsStore();
 // (local trigger or detected via status polling).
 sync.onSyncComplete(() => {
   sessions.invalidateFilterCaches();
-  sessions.load();
+  sessions.refreshSidebarIfAttached();
 });

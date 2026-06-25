@@ -1,7 +1,8 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect } from "vite-plus/test";
 import {
   KNOWN_AGENTS,
   agentColor,
+  agentForeground,
   agentLabel,
 } from "./agents.js";
 
@@ -10,6 +11,7 @@ describe("KNOWN_AGENTS", () => {
     const names = KNOWN_AGENTS.map((a) => a.name);
     expect(names).toEqual([
       "claude",
+      "cowork",
       "codex",
       "copilot",
       "gemini",
@@ -20,8 +22,11 @@ describe("KNOWN_AGENTS", () => {
       "zencoder",
       "zed",
       "vscode-copilot",
+      "visualstudio-copilot",
       "pi",
       "qwen",
+      "qwenpaw",
+      "deepseek-tui",
       "openclaw",
       "qclaw",
       "iflow",
@@ -35,6 +40,7 @@ describe("KNOWN_AGENTS", () => {
       "piebald",
       "antigravity",
       "antigravity-cli",
+      "vibe",
     ]);
   });
 
@@ -83,8 +89,17 @@ describe("agentColor", () => {
     expect(agentColor("qwen")).toBe(
       "var(--accent-cyan)",
     );
+    expect(agentColor("qwenpaw")).toBe(
+      "var(--accent-cyan)",
+    );
+    expect(agentColor("deepseek-tui")).toBe(
+      "var(--accent-cyan)",
+    );
     expect(agentColor("vscode-copilot")).toBe(
       "var(--accent-teal)",
+    );
+    expect(agentColor("visualstudio-copilot")).toBe(
+      "var(--accent-blue)",
     );
     expect(agentColor("qclaw")).toBe(
       "var(--accent-orange)",
@@ -105,10 +120,40 @@ describe("agentColor", () => {
   });
 });
 
+describe("agentForeground", () => {
+  it("returns the matching foreground token for every known agent fill", () => {
+    for (const agent of KNOWN_AGENTS) {
+      const color = agentColor(agent.name);
+      const token = color.match(/^var\(--accent-([a-z]+)\)$/)?.[1];
+      expect(token, `${agent.name} color token`).toBeTruthy();
+      expect(agentForeground(agent.name)).toBe(
+        `var(--accent-${token}-foreground)`,
+      );
+    }
+  });
+
+  it("uses the accent foreground for unknown fallback agents", () => {
+    expect(agentForeground("unknown")).toBe(
+      "var(--accent-blue-foreground)",
+    );
+    expect(agentForeground("")).toBe("var(--accent-blue-foreground)");
+  });
+
+  it("uses non-blue accent foregrounds for non-blue agent fills", () => {
+    expect(agentForeground("codex")).toBe("var(--accent-green-foreground)");
+    expect(agentForeground("opencode")).toBe(
+      "var(--accent-purple-foreground)",
+    );
+  });
+});
+
 describe("agentLabel", () => {
   it("returns explicit labels for hyphenated agents", () => {
     expect(agentLabel("vscode-copilot")).toBe(
       "VS Code Copilot",
+    );
+    expect(agentLabel("visualstudio-copilot")).toBe(
+      "Visual Studio Copilot",
     );
     expect(agentLabel("openhands")).toBe("OpenHands");
     expect(agentLabel("openclaw")).toBe("OpenClaw");
@@ -118,6 +163,8 @@ describe("agentLabel", () => {
     expect(agentLabel("piebald")).toBe("Piebald");
     expect(agentLabel("zed")).toBe("Zed");
     expect(agentLabel("qwen")).toBe("Qwen Code");
+    expect(agentLabel("qwenpaw")).toBe("QwenPaw");
+    expect(agentLabel("deepseek-tui")).toBe("DeepSeek TUI");
   });
 
   it("capitalizes simple agent names", () => {

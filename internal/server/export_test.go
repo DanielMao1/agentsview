@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -711,6 +712,61 @@ func TestGenerateExportMarkdown_SerializesCodeSkillAndCDATAFallback(t *testing.T
 	})
 }
 
+func TestGenerateExportMarkdown_RendersCursorApplyPatch(t *testing.T) {
+	t.Parallel()
+	session := testSession()
+	msgs := []db.Message{{
+		SessionID:  "test-id",
+		Ordinal:    0,
+		Role:       "assistant",
+		Content:    "[Patch: src/app.ts]\n@@ -1,1 +1,1 @@\n-old\n+new",
+		HasToolUse: true,
+		ToolCalls: []db.ToolCall{{
+			ToolName:  "ApplyPatch",
+			Category:  "Edit",
+			ToolUseID: "toolu_patch",
+			InputJSON: `{"path":"src/app.ts","patch":"@@ -1,1 +1,1 @@\n-old\n+new"}`,
+		}},
+	}}
+
+	out := generateExportMarkdown(session, msgs, exportMarkdownOptions{})
+	assertContainsAll(t, out, []string{
+		`<tool_call id="toolu_patch" name="ApplyPatch" category="Edit">`,
+		`<tool_body><![CDATA[` + "\n@@ -1,1 +1,1 @@\n-old\n+new\n" + `]]></tool_body>`,
+	})
+	assertContainsNone(t, out, []string{
+		`[Patch: src/app.ts]`,
+		`patch: @@ -1,1 +1,1 @@`,
+	})
+}
+
+func TestGenerateExportMarkdown_RendersCursorApplyPatchFromInputJSON(t *testing.T) {
+	t.Parallel()
+	session := testSession()
+	msgs := []db.Message{{
+		SessionID:  "test-id",
+		Ordinal:    0,
+		Role:       "assistant",
+		Content:    "[Patch: src/app.ts]",
+		HasToolUse: true,
+		ToolCalls: []db.ToolCall{{
+			ToolName:  "ApplyPatch",
+			Category:  "Edit",
+			ToolUseID: "toolu_patch",
+			InputJSON: `{"path":"src/app.ts","patch":"@@ -1,1 +1,1 @@\n-old\n+new"}`,
+		}},
+	}}
+
+	out := generateExportMarkdown(session, msgs, exportMarkdownOptions{})
+	assertContainsAll(t, out, []string{
+		`<tool_call id="toolu_patch" name="ApplyPatch" category="Edit">`,
+		`<tool_body><![CDATA[` + "\n@@ -1,1 +1,1 @@\n-old\n+new\n" + `]]></tool_body>`,
+	})
+	assertContainsNone(t, out, []string{
+		`[Patch: src/app.ts]`,
+	})
+}
+
 func TestGenerateExportMarkdown_OmitsEmptyOptionalAttributes(t *testing.T) {
 	t.Parallel()
 	session := testSession(func(s *db.Session) {
@@ -1249,4 +1305,11 @@ func TestValidateGithubToken(t *testing.T) {
 			assert.Equal(t, tt.wantLogin, login)
 		})
 	}
+}
+
+func TestGithubHTTPClientUsesIsolatedTransport(t *testing.T) {
+	client := githubHTTPClient(10 * time.Second)
+	require.NotNil(t, client.Transport)
+	assert.NotSame(t, http.DefaultTransport, client.Transport,
+		"github API clients must not share the package default transport")
 }

@@ -1,10 +1,15 @@
 <script lang="ts">
+  import { m } from "../../i18n/index.js";
   import {
+    ActivityIcon,
+    AlignJustifyIcon,
     ArrowDownIcon,
     ArrowDownWideNarrowIcon,
     ArrowUpNarrowWideIcon,
     CheckIcon,
     CloudUploadIcon,
+    CopyIcon,
+    DatabaseBackupIcon,
     DownloadIcon,
     EllipsisIcon,
     FunnelIcon,
@@ -19,7 +24,6 @@
     MenuIcon,
     MoonIcon,
     MoreHorizontalIcon,
-    RefreshCwIcon,
     SearchIcon,
     SettingsIcon,
     SunIcon,
@@ -43,7 +47,7 @@
   import ImportModal from "../import/ImportModal.svelte";
 
   const isMac = navigator.platform.toUpperCase().includes("MAC");
-  const modKey = isMac ? "Cmd" : "Ctrl";
+  const modKey = isMac ? "⌘" : "Ctrl";
 
   let showImportModal = $state(false);
   let showBlockFilter = $state(false);
@@ -76,12 +80,12 @@
   let moreDropRef: HTMLDivElement | undefined =
     $state(undefined);
 
-  const BLOCK_LABELS: Record<BlockType, string> = {
-    user: "User messages",
-    assistant: "Assistant text",
-    thinking: "Thinking blocks",
-    tool: "Tool calls",
-    code: "Code blocks",
+  const BLOCK_LABELS: Record<BlockType, () => string> = {
+    user: m.header_transcript_blocks_user,
+    assistant: m.header_transcript_blocks_assistant,
+    thinking: m.header_transcript_blocks_thinking,
+    tool: m.header_transcript_blocks_tool,
+    code: m.header_transcript_blocks_code,
   };
 
   const BLOCK_COLORS: Record<BlockType, string> = {
@@ -119,6 +123,15 @@
     showOverflow = false;
   }
 
+  async function handleCopySourceFilePath() {
+    const filePath = sessions.activeSession?.file_path;
+    if (!filePath) return;
+    const ok = await copyToClipboard(filePath);
+    if (!ok) return;
+    showExportMenu = false;
+    showOverflow = false;
+  }
+
   function openPublish(secret: boolean) {
     ui.publishSecret = secret;
     ui.activeModal = "publish";
@@ -128,6 +141,9 @@
 
   const hasActiveSession = $derived(
     sessions.activeSessionId !== null,
+  );
+  const activeSessionFilePath = $derived(
+    sessions.activeSession?.file_path ?? "",
   );
 
   // Close block filter dropdown on outside click
@@ -247,8 +263,10 @@
     <LayoutListIcon {size} strokeWidth="2" aria-hidden="true" />
   {:else if ui.messageLayout === "compact"}
     <ListCollapseIcon {size} strokeWidth="2" aria-hidden="true" />
-  {:else}
+  {:else if ui.messageLayout === "stream"}
     <LogsIcon {size} strokeWidth="2" aria-hidden="true" />
+  {:else}
+    <AlignJustifyIcon {size} strokeWidth="2" aria-hidden="true" />
   {/if}
 {/snippet}
 
@@ -264,15 +282,15 @@
           ui.toggleSidebar();
         }
       }}
-      title="Toggle sidebar (b)"
-      aria-label="Toggle sidebar"
+      title={m.nav_toggle_sidebar_shortcut()}
+      aria-label={m.nav_toggle_sidebar()}
     >
       <MenuIcon size="16" strokeWidth="2" aria-hidden="true" />
     </button>
     <button
       class="header-home"
       onclick={() => router.navigate("sessions")}
-      title="Home"
+      title={m.nav_home()}
     >
       <svg class="header-logo" width="18" height="18" viewBox="0 0 32 32" aria-hidden="true">
         <rect width="32" height="32" rx="6" fill="var(--accent-blue, #3b82f6)"/>
@@ -294,58 +312,74 @@
       class="nav-btn"
       class:active={router.route === "sessions"}
       onclick={() => router.navigate("sessions")}
-      title="Sessions"
-      aria-label="Sessions"
+      title={m.nav_sessions()}
+      aria-label={m.nav_sessions()}
     >
       <LayoutGridIcon size="12" strokeWidth="2" aria-hidden="true" />
-      <span class="nav-label">Sessions</span>
+      <span class="nav-label">{m.nav_sessions()}</span>
     </button>
 
     <button
       class="nav-btn"
       class:active={router.route === "usage"}
       onclick={() => router.navigate("usage")}
-      title="Token Usage"
-      aria-label="Usage"
+      title={m.nav_token_usage()}
+      aria-label={m.nav_usage()}
     >
       <Grid2x2Icon size="12" strokeWidth="2" aria-hidden="true" />
-      <span class="nav-label">Usage</span>
+      <span class="nav-label">{m.nav_usage()}</span>
+    </button>
+
+    <button
+      class="nav-btn"
+      class:active={router.route === "activity"}
+      onclick={() => router.navigate("activity")}
+      title={m.nav_activity()}
+      aria-label={m.nav_activity()}
+    >
+      <ActivityIcon size="12" strokeWidth="2" aria-hidden="true" />
+      <span class="nav-label">{m.nav_activity()}</span>
     </button>
 
     <div class="more-wrap">
       <button
         class="nav-btn"
-        class:active={router.route === "trends" || router.route === "pinned" || router.route === "insights" || router.route === "trash" || moreOpen}
+        class:active={router.route === "trends" || router.route === "pinned" || router.route === "insights" || router.route === "trash" || router.route === "recent-edits" || moreOpen}
         bind:this={moreBtnRef}
         onclick={() => { moreOpen = !moreOpen; }}
-        title="More navigation"
-        aria-label="More navigation"
+        title={m.nav_more_navigation()}
+        aria-label={m.nav_more_navigation()}
         aria-expanded={moreOpen}
       >
         <EllipsisIcon size="12" strokeWidth="2.4" aria-hidden="true" />
-        <span class="nav-label">More</span>
+        <span class="nav-label">{m.nav_more()}</span>
       </button>
       {#if moreOpen}
         <div class="more-dropdown" role="menu" bind:this={moreDropRef}>
           <button class="more-item" role="menuitem"
             class:active={router.route === "trends"}
             onclick={() => { router.navigate("trends"); moreOpen = false; }}>
-            Trends
+            {m.nav_trends()}
           </button>
           <button class="more-item" role="menuitem"
             class:active={router.route === "pinned"}
             onclick={() => { router.navigate("pinned"); moreOpen = false; }}>
-            Pinned
+            {m.nav_pinned()}
           </button>
           <button class="more-item" role="menuitem"
             class:active={router.route === "insights"}
             onclick={() => { router.navigate("insights"); moreOpen = false; }}>
-            Insights
+            {m.nav_insights()}
           </button>
           <button class="more-item" role="menuitem"
             class:active={router.route === "trash"}
             onclick={() => { router.navigate("trash"); moreOpen = false; }}>
-            Trash
+            {m.nav_trash()}
+          </button>
+          <button class="more-item" role="menuitem"
+            class:active={router.route === "recent-edits"}
+            onclick={() => { router.navigate("recent-edits"); moreOpen = false; }}>
+            {m.nav_recent_edits()}
           </button>
         </div>
       {/if}
@@ -355,11 +389,11 @@
   <button
     class="search-hint"
     onclick={() => (ui.activeModal = "commandPalette")}
-    title="Search sessions ({modKey}+K)"
+    title={m.nav_search_sessions_shortcut({ shortcut: `${modKey} K` })}
   >
     <SearchIcon size="12" strokeWidth="2" aria-hidden="true" />
-    <span class="search-hint-text">Search sessions...</span>
-    <kbd class="search-hint-kbd">{modKey}+K</kbd>
+    <span class="search-hint-text">{m.nav_search_sessions()}</span>
+    <kbd class="search-hint-kbd">{modKey} K</kbd>
   </button>
 
   <div class="header-right">
@@ -370,19 +404,19 @@
           class="pill"
           class:active={ui.transcriptMode === "normal"}
           onclick={() => ui.setTranscriptMode("normal")}
-          title="Normal transcript — show all messages"
-          aria-label="Normal transcript mode"
+          title={m.header_transcript_normal_title()}
+          aria-label={m.header_transcript_normal_label()}
         >
-          <span class="pill-label">Normal</span>
+          <span class="pill-label">{m.header_transcript_normal()}</span>
         </button>
         <button
           class="pill"
           class:active={ui.transcriptMode === "focused"}
           onclick={() => ui.setTranscriptMode("focused")}
-          title="Focused transcript — user prompts and final answers only"
-          aria-label="Focused transcript mode"
+          title={m.header_transcript_focused_title()}
+          aria-label={m.header_transcript_focused_label()}
         >
-          <span class="pill-label">Focused</span>
+          <span class="pill-label">{m.header_transcript_focused()}</span>
         </button>
 
         <span class="strip-divider"></span>
@@ -393,8 +427,8 @@
             class:filter-active={ui.hasBlockFilters}
             bind:this={filterBtnRef}
             onclick={() => (showBlockFilter = !showBlockFilter)}
-            title="Filter block types"
-            aria-label="Filter block types"
+            title={m.header_transcript_filter_title()}
+            aria-label={m.header_transcript_filter_label()}
           >
             <FunnelIcon size="12" strokeWidth="2" aria-hidden="true" />
             {#if ui.hasBlockFilters}
@@ -404,7 +438,7 @@
 
           {#if showBlockFilter}
             <div class="block-filter-dropdown" bind:this={filterDropRef}>
-              <div class="block-filter-title">Block Visibility</div>
+              <div class="block-filter-title">{m.header_transcript_visibility()}</div>
               {#each ALL_BLOCK_TYPES as bt}
                 {@const visible = ui.isBlockVisible(bt)}
                 <button
@@ -416,7 +450,7 @@
                     class="block-filter-dot"
                     style:background={visible ? BLOCK_COLORS[bt] : "var(--border-muted)"}
                   ></span>
-                  <span class="block-filter-label">{BLOCK_LABELS[bt]}</span>
+                  <span class="block-filter-label">{BLOCK_LABELS[bt]()}</span>
                   <span class="block-filter-check" class:on={visible}>
                     {#if visible}
                       <CheckIcon size="10" strokeWidth="2.4" aria-hidden="true" />
@@ -429,7 +463,7 @@
                   class="block-filter-reset"
                   onclick={() => ui.showAllBlocks()}
                 >
-                  Show all
+                  {m.header_transcript_show_all()}
                 </button>
               {/if}
             </div>
@@ -441,8 +475,8 @@
         class="header-btn"
         class:active={ui.followLatest}
         onclick={() => ui.toggleFollowLatest()}
-        title="Follow latest messages"
-        aria-label="Follow latest messages"
+        title={m.header_actions_follow_latest()}
+        aria-label={m.header_actions_follow_latest()}
         aria-pressed={ui.followLatest}
       >
         <ArrowDownIcon size="14" strokeWidth="2" aria-hidden="true" />
@@ -451,8 +485,8 @@
       <button
         class="header-btn"
         onclick={() => ui.toggleSort()}
-        title="Toggle sort order (o)"
-        aria-label="Toggle sort order"
+        title={m.header_actions_toggle_sort()}
+        aria-label={m.header_actions_toggle_sort()}
       >
         {#if ui.sortNewestFirst}
           <ArrowDownWideNarrowIcon size="14" strokeWidth="2" aria-hidden="true" />
@@ -465,8 +499,8 @@
       <button
         class="header-btn collapsible"
         onclick={() => ui.cycleLayout()}
-        title="Cycle layout: {ui.messageLayout} (l)"
-        aria-label="Cycle message layout"
+        title={m.header_actions_cycle_layout({ layout: ui.messageLayout })}
+        aria-label={m.header_actions_cycle_layout_label()}
       >
         {@render messageLayoutIcon("14")}
       </button>
@@ -480,8 +514,8 @@
             showOverflow = false;
           }}
           disabled={!sessions.activeSessionId}
-          title="Export session options"
-          aria-label="Export session"
+          title={m.header_actions_export_options()}
+          aria-label={m.header_actions_export_session()}
           aria-expanded={showExportMenu}
         >
           <CloudUploadIcon size="14" strokeWidth="2" aria-hidden="true" />
@@ -497,7 +531,7 @@
               }}
             >
               <CloudUploadIcon size="13" strokeWidth="2" aria-hidden="true" />
-              <span>Download HTML export</span>
+              <span>{m.header_actions_download_html()}</span>
             </button>
             <button
               class="overflow-item"
@@ -510,12 +544,21 @@
               {/if}
               <span>
                 {#if copiedMarkdownLink}
-                  Copied markdown link
+                  {m.header_actions_copied_markdown_link()}
                 {:else}
-                  Copy markdown export link
+                  {m.header_actions_copy_markdown_link()}
                 {/if}
               </span>
             </button>
+            {#if activeSessionFilePath}
+              <button
+                class="overflow-item"
+                onclick={handleCopySourceFilePath}
+              >
+                <CopyIcon size="13" strokeWidth="2" aria-hidden="true" />
+                <span>{m.header_actions_copy_source_path()}</span>
+              </button>
+            {/if}
           </div>
         {/if}
       </div>
@@ -530,8 +573,8 @@
             showOverflow = false;
           }}
           disabled={!sessions.activeSessionId}
-          title="Publish to Gist (p)"
-          aria-label="Publish to Gist"
+          title={m.header_actions_publish_title()}
+          aria-label={m.header_actions_publish_label()}
           aria-expanded={showPublishMenu}
         >
           <UploadIcon size="14" strokeWidth="2" aria-hidden="true" />
@@ -544,14 +587,14 @@
               onclick={() => openPublish(false)}
             >
               <GlobeIcon size="13" strokeWidth="2" aria-hidden="true" />
-              <span>Publish public Gist</span>
+              <span>{m.header_actions_publish_public()}</span>
             </button>
             <button
               class="overflow-item"
               onclick={() => openPublish(true)}
             >
               <LockIcon size="13" strokeWidth="2" aria-hidden="true" />
-              <span>Publish secret Gist</span>
+              <span>{m.header_actions_publish_secret()}</span>
             </button>
           </div>
         {/if}
@@ -563,8 +606,8 @@
           class="header-btn overflow-btn"
           bind:this={overflowBtnRef}
           onclick={() => (showOverflow = !showOverflow)}
-          title="More actions"
-          aria-label="More actions"
+          title={m.header_actions_more_actions()}
+          aria-label={m.header_actions_more_actions()}
         >
           <MoreHorizontalIcon size="14" strokeWidth="2.4" aria-hidden="true" />
         </button>
@@ -576,14 +619,14 @@
               onclick={() => { ui.cycleLayout(); showOverflow = false; }}
             >
               {@render messageLayoutIcon("13")}
-              <span>Layout: {ui.messageLayout}</span>
+              <span>{m.header_actions_layout({ layout: ui.messageLayout })}</span>
             </button>
             <button
               class="overflow-item"
               onclick={() => { handleExport(); showOverflow = false; }}
             >
               <CloudUploadIcon size="13" strokeWidth="2" aria-hidden="true" />
-              <span>Download HTML export</span>
+              <span>{m.header_actions_download_html()}</span>
             </button>
             <button
               class="overflow-item"
@@ -596,25 +639,34 @@
               {/if}
               <span>
                 {#if copiedMarkdownLink}
-                  Copied markdown link
+                  {m.header_actions_copied_markdown_link()}
                 {:else}
-                  Copy markdown export link
+                  {m.header_actions_copy_markdown_link()}
                 {/if}
               </span>
             </button>
+            {#if activeSessionFilePath}
+              <button
+                class="overflow-item"
+                onclick={handleCopySourceFilePath}
+              >
+                <CopyIcon size="13" strokeWidth="2" aria-hidden="true" />
+                <span>{m.header_actions_copy_source_path()}</span>
+              </button>
+            {/if}
             <button
               class="overflow-item"
               onclick={() => openPublish(false)}
             >
               <UploadIcon size="13" strokeWidth="2" aria-hidden="true" />
-              <span>Publish public Gist</span>
+              <span>{m.header_actions_publish_public()}</span>
             </button>
             <button
               class="overflow-item"
               onclick={() => openPublish(true)}
             >
               <LockIcon size="13" strokeWidth="2" aria-hidden="true" />
-              <span>Publish secret Gist</span>
+              <span>{m.header_actions_publish_secret()}</span>
             </button>
           </div>
         {/if}
@@ -622,14 +674,15 @@
     {/if}
 
     <button
-      class="header-btn"
+      class="header-btn sync-btn"
       class:syncing={sync.syncing}
       onclick={() => sync.triggerSync()}
       disabled={sync.syncing}
-      title={sync.readOnly ? "Refresh data (r)" : "Sync sessions (r)"}
-      aria-label={sync.readOnly ? "Refresh data" : "Sync sessions"}
+      title={sync.readOnly ? m.header_actions_refresh_data_shortcut() : m.header_actions_sync_sessions_shortcut()}
+      aria-label={sync.readOnly ? m.header_actions_refresh_data() : m.header_actions_sync_sessions()}
     >
-      <RefreshCwIcon size="14" strokeWidth="2" aria-hidden="true" />
+      <DatabaseBackupIcon size="14" strokeWidth="2" aria-hidden="true" />
+      <span class="sync-label">{sync.readOnly ? m.header_actions_refresh() : m.header_actions_sync()}</span>
     </button>
 
     <button
@@ -639,12 +692,12 @@
       }}
       disabled={sync.readOnly}
       title={sync.readOnly
-        ? "Import unavailable in read-only mode"
-        : "Import conversations"}
-      aria-label="Import conversations"
+        ? m.header_actions_import_unavailable()
+        : m.header_actions_import_conversations()}
+      aria-label={m.header_actions_import_conversations()}
     >
       <DownloadIcon size="12" strokeWidth="2" aria-hidden="true" />
-      <span class="import-label">Import</span>
+      <span class="import-label">{m.header_actions_import()}</span>
     </button>
 
     <span class="header-divider"></span>
@@ -652,8 +705,8 @@
     <button
       class="header-btn"
       onclick={() => ui.toggleTheme()}
-      title="Toggle theme"
-      aria-label="Toggle theme"
+      title={m.header_actions_toggle_theme()}
+      aria-label={m.header_actions_toggle_theme()}
     >
       {#if ui.theme === "light"}
         <MoonIcon size="14" strokeWidth="2" aria-hidden="true" />
@@ -666,8 +719,8 @@
       class="header-btn"
       class:active={router.route === "settings"}
       onclick={() => router.navigate("settings")}
-      title="Settings"
-      aria-label="Settings"
+      title={m.header_actions_settings()}
+      aria-label={m.header_actions_settings()}
     >
       <SettingsIcon size="14" strokeWidth="2" aria-hidden="true" />
     </button>
@@ -675,8 +728,8 @@
     <button
       class="header-btn"
       onclick={() => (ui.activeModal = "shortcuts")}
-      title="Keyboard shortcuts (?)"
-      aria-label="Keyboard shortcuts"
+      title={m.header_actions_keyboard_shortcuts_shortcut()}
+      aria-label={m.header_actions_keyboard_shortcuts()}
     >
       ?
     </button>
@@ -935,7 +988,7 @@
     height: 11px;
     border-radius: 50%;
     background: var(--accent-amber);
-    color: white;
+    color: var(--accent-amber-foreground);
     font-size: 7px;
     font-weight: 700;
     display: flex;
@@ -1071,7 +1124,20 @@
   }
 
   .header-btn.syncing {
+    color: var(--text-secondary);
+  }
+
+  .header-btn.syncing :global(svg) {
     animation: spin 1s linear infinite;
+  }
+
+  .sync-btn {
+    width: auto;
+    min-width: 56px;
+    gap: 5px;
+    padding: 0 9px;
+    font-size: 11px;
+    font-weight: 500;
   }
 
   /* ── Import button (icon + label) ── */

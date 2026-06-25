@@ -28,22 +28,30 @@ const (
 // ORM: callers still own SELECTs, JOINs, backend-specific search paths, and
 // table schemas.
 type QueryDialect struct {
-	name                   string
-	placeholderStyle       placeholderStyle
-	trueLiteral            string
-	falseLiteral           string
-	dateExpr               string
-	dateParam              func(string) string
-	activityExpr           string
-	activityParam          func(string) string
-	cursorActivityExpr     string
-	cursorParam            func(string) string
-	terminationExpr        string
-	terminationKind        timestampKind
-	caseInsensitiveLike    string
-	caseInsensitiveLikeEsc string
-	regexPredicate         func(string, string) string
-	nullsLast              bool
+	name               string
+	placeholderStyle   placeholderStyle
+	trueLiteral        string
+	falseLiteral       string
+	dateExpr           string
+	dateParam          func(string) string
+	activityExpr       string
+	activityParam      func(string) string
+	cursorActivityExpr string
+	cursorParam        func(string) string
+	// castCursor wraps a placeholder with the type cast a keyset cursor value of
+	// the given kind needs in this dialect.
+	castCursor func(string, valueKind) string
+	// emptyStringIsNull is true for backends (SQLite) that store unset
+	// timestamps as empty strings rather than SQL NULL.
+	emptyStringIsNull           bool
+	terminationExpr             string
+	terminationKind             timestampKind
+	caseInsensitiveLike         string
+	caseInsensitiveLikeEsc      string
+	regexPredicate              func(string, string) string
+	sidebarChildRelationships   []string
+	canonicalChildRelationships []string
+	nullsLast                   bool
 }
 
 // SQLiteQueryDialect returns the SQLite SQL fragments used by the local store.
@@ -60,6 +68,8 @@ func SQLiteQueryDialect() QueryDialect {
 		activityParam:          func(ph string) string { return ph },
 		cursorActivityExpr:     "COALESCE(NULLIF(ended_at, ''), NULLIF(started_at, ''), created_at)",
 		cursorParam:            func(ph string) string { return ph },
+		castCursor:             func(ph string, _ valueKind) string { return ph },
+		emptyStringIsNull:      true,
 		terminationExpr:        activityExprSQLite,
 		terminationKind:        timestampUnixSeconds,
 		caseInsensitiveLike:    "LIKE",
@@ -67,6 +77,8 @@ func SQLiteQueryDialect() QueryDialect {
 		regexPredicate: func(col, ph string) string {
 			return col + " REGEXP " + ph
 		},
+		sidebarChildRelationships:   []string{"subagent", "fork"},
+		canonicalChildRelationships: []string{"subagent", "fork", "continuation"},
 	}
 }
 
@@ -89,6 +101,7 @@ func PostgresQueryDialect() QueryDialect {
 		cursorParam: func(ph string) string {
 			return ph + "::timestamptz"
 		},
+		castCursor:             pgCastCursor,
 		terminationExpr:        "COALESCE(ended_at, started_at, created_at)",
 		terminationKind:        timestampTimestamptz,
 		caseInsensitiveLike:    "ILIKE",
@@ -96,7 +109,9 @@ func PostgresQueryDialect() QueryDialect {
 		regexPredicate: func(col, ph string) string {
 			return col + " ~* " + ph
 		},
-		nullsLast: true,
+		sidebarChildRelationships:   []string{"subagent", "fork"},
+		canonicalChildRelationships: []string{"subagent", "fork", "continuation"},
+		nullsLast:                   true,
 	}
 }
 
@@ -118,6 +133,7 @@ func DuckDBQueryDialect() QueryDialect {
 		cursorParam: func(ph string) string {
 			return "CAST(" + ph + " AS TIMESTAMP)"
 		},
+		castCursor:             duckCastCursor,
 		terminationExpr:        "COALESCE(ended_at, started_at, created_at)",
 		terminationKind:        timestampCast,
 		caseInsensitiveLike:    "ILIKE",
@@ -125,7 +141,9 @@ func DuckDBQueryDialect() QueryDialect {
 		regexPredicate: func(col, ph string) string {
 			return "regexp_matches(" + col + ", " + ph + ")"
 		},
-		nullsLast: true,
+		sidebarChildRelationships:   []string{"subagent", "fork"},
+		canonicalChildRelationships: []string{"subagent", "fork", "continuation"},
+		nullsLast:                   true,
 	}
 }
 
@@ -199,6 +217,103 @@ func (b *QueryBuilder) CursorBeforePredicate(cur SessionCursor) string {
 	return "(" + b.dialect.cursorActivityExpr + ", id) < (" + ea + ", " + id + ")"
 }
 
+func pgCastCursor(ph string, kind valueKind) string {
+	switch kind {
+	case kindTimestamp:
+		return ph + "::timestamptz"
+	case kindInt:
+		return ph + "::bigint"
+	case kindReal:
+		return ph + "::double precision"
+	default:
+		return ph
+	}
+}
+
+func duckCastCursor(ph string, kind valueKind) string {
+	switch kind {
+	case kindTimestamp:
+		return "CAST(" + ph + " AS TIMESTAMP)"
+	case kindInt:
+		return "CAST(" + ph + " AS BIGINT)"
+	case kindReal:
+		return "CAST(" + ph + " AS DOUBLE)"
+	default:
+		return ph
+	}
+}
+
+// timestampExpr returns a column reference that treats unset timestamps as NULL.
+// SQLite stores empty strings for missing timestamps; other backends use real
+// NULLs, so the column reference passes through unchanged.
+func (d QueryDialect) timestampExpr(col string) string {
+	if d.emptyStringIsNull {
+		return "NULLIF(" + col + ", '')"
+	}
+	return col
+}
+
+// OrderByClause renders the session-list ordering for the resolved sort terms,
+// each in its own direction, with id appended as a unique same-direction
+// tie-breaker (unless id is already a sort term) so keyset pagination is
+// deterministic. Sort expressions may add bind parameters (the secrets sort), so
+// callers must render this at its textual position.
+func (b *QueryBuilder) OrderByClause(rs []ResolvedSort, f SessionFilter) string {
+	cols := appendIDTiebreaker(rs)
+	parts := make([]string, len(cols))
+	for i, c := range cols {
+		parts[i] = c.Sort.orderExpr(b, c.Desc, f) + " " + orderDirSQL(c.Desc)
+	}
+	return "ORDER BY " + strings.Join(parts, ", ")
+}
+
+// CursorPredicate renders the keyset pagination predicate matching an
+// OrderByClause built from the same sort terms. Because per-key directions may
+// differ, the predicate is the lexicographic expansion
+//
+//	(c1 OP1 v1) OR (c1 = v1 AND c2 OP2 v2) OR ...
+//
+// rather than a single row-value comparison (which is only valid when every
+// column shares one direction). Each value is bound and cast per dialect for its
+// column kind, and must already be the Go type produced by CursorPredicateValues
+// (one value per resolved term, in order). Sort expressions are re-rendered for
+// each clause they appear in so any bind parameters they add (the secrets sort)
+// stay positionally aligned across dialects.
+func (b *QueryBuilder) CursorPredicate(
+	rs []ResolvedSort, f SessionFilter, values []any, id string,
+) string {
+	cols := appendIDTiebreaker(rs)
+	vals := values
+	if len(cols) > len(rs) {
+		vals = append(append(make([]any, 0, len(cols)), values...), id)
+	}
+	clauses := make([]string, 0, len(cols))
+	for j := range cols {
+		parts := make([]string, 0, j+1)
+		for i := range j {
+			e := cols[i].Sort.orderExpr(b, cols[i].Desc, f)
+			vp := b.dialect.castCursor(b.Add(vals[i]), cols[i].Sort.kind)
+			parts = append(parts, e+" = "+vp)
+		}
+		op := ">"
+		if cols[j].Desc {
+			op = "<"
+		}
+		e := cols[j].Sort.orderExpr(b, cols[j].Desc, f)
+		vp := b.dialect.castCursor(b.Add(vals[j]), cols[j].Sort.kind)
+		parts = append(parts, e+" "+op+" "+vp)
+		clauses = append(clauses, "("+strings.Join(parts, " AND ")+")")
+	}
+	return "(" + strings.Join(clauses, " OR ") + ")"
+}
+
+func orderDirSQL(desc bool) string {
+	if desc {
+		return "DESC"
+	}
+	return "ASC"
+}
+
 // LimitOffset renders a parameterized LIMIT/OFFSET clause.
 func (b *QueryBuilder) LimitOffset(limit, offset int) string {
 	limitPH := b.Add(limit)
@@ -238,6 +353,67 @@ func BuildSessionFilterSQL(
 	return where, b.Args()
 }
 
+// BuildSessionBaseFilterSQL returns the base sidebar/list predicates without the
+// child-relationship exclusion. Callers that handle root-vs-child selection
+// separately should use this to avoid diverging filter logic across backends.
+func BuildSessionBaseFilterSQL(
+	f SessionFilter, dialect QueryDialect,
+) (string, []any) {
+	b := NewQueryBuilder(dialect, 0)
+	preds := []string{
+		"message_count > 0",
+		"deleted_at IS NULL",
+	}
+	filterPreds, oneShotPred := sessionFilterPredicates(f, b, func(col string) string { return col })
+	preds = append(preds, filterPreds...)
+	if oneShotPred != "" {
+		preds = append(preds, oneShotPred)
+	}
+	return strings.Join(preds, " AND "), b.Args()
+}
+
+func (d QueryDialect) SidebarChildRelationshipsSQL() string {
+	quoted := make([]string, 0, len(d.sidebarChildRelationships))
+	for _, rel := range d.sidebarChildRelationships {
+		quoted = append(quoted, "'"+rel+"'")
+	}
+	return strings.Join(quoted, ", ")
+}
+
+func (d QueryDialect) CanonicalChildRelationshipsSQL() string {
+	quoted := make([]string, 0, len(d.canonicalChildRelationships))
+	for _, rel := range d.canonicalChildRelationships {
+		quoted = append(quoted, "'"+rel+"'")
+	}
+	return strings.Join(quoted, ", ")
+}
+
+func SidebarChildRelationshipPredicate(dialect QueryDialect, sessionAlias string) string {
+	return sessionAlias + ".relationship_type IN (" + dialect.SidebarChildRelationshipsSQL() + ")"
+}
+
+func CanonicalChildRelationshipPredicate(dialect QueryDialect, sessionAlias string) string {
+	return sessionAlias + ".relationship_type IN (" + dialect.CanonicalChildRelationshipsSQL() + ")"
+}
+
+func SidebarOrphanPredicate(sessionAlias, parentAlias string) string {
+	return `NOT EXISTS (
+			SELECT 1
+			FROM sessions ` + parentAlias + `
+			WHERE ` + parentAlias + `.id = ` + sessionAlias + `.parent_session_id
+		)`
+}
+
+func BuildCanonicalRootWhere(dialect QueryDialect, sessionAlias string, includeOrphans bool) string {
+	base := `NOT (` + CanonicalChildRelationshipPredicate(dialect, sessionAlias) + `)`
+	if !includeOrphans {
+		return base
+	}
+	return `(` + base + ` OR (` +
+		CanonicalChildRelationshipPredicate(dialect, sessionAlias) + ` AND ` +
+		SidebarOrphanPredicate(sessionAlias, "parent") + `))`
+}
+
 func buildSessionFilterWithBuilder(
 	f SessionFilter, b *QueryBuilder, qualifier string,
 ) string {
@@ -254,7 +430,7 @@ func buildSessionFilterWithBuilder(
 	}
 	if !f.IncludeChildren {
 		basePreds = append(basePreds,
-			q("relationship_type")+" NOT IN ('subagent', 'fork')")
+			q("relationship_type")+" NOT IN ("+b.dialect.SidebarChildRelationshipsSQL()+")")
 	}
 
 	if !f.IncludeChildren {
@@ -275,7 +451,7 @@ func buildSessionFilterWithBuilder(
 		rootMatchParts = append(rootMatchParts, oneShotPred)
 	}
 	rootMatchParts = append(rootMatchParts,
-		"root_session.relationship_type NOT IN ('subagent', 'fork')")
+		BuildCanonicalRootWhere(b.dialect, "root_session", f.IncludeOrphans))
 	rootMatch := strings.Join(rootMatchParts, " AND ")
 
 	cte := "WITH RECURSIVE tree(id) AS (" +
@@ -343,10 +519,11 @@ func sessionFilterPredicates(
 		preds = append(preds, pred)
 	}
 
+	scope := normalizeAutomatedScope(f.AutomatedScope, f.ExcludeAutomated)
 	oneShotPred := ""
 	if f.ExcludeOneShot {
 		pred := q("user_message_count") + " > 1"
-		if !f.ExcludeAutomated {
+		if scope != "human" {
 			pred = "(" + q("user_message_count") + " > 1 OR " +
 				q("is_automated") + " = " +
 				b.dialect.trueLiteral + ")"
@@ -357,9 +534,13 @@ func sessionFilterPredicates(
 			preds = append(preds, pred)
 		}
 	}
-	if f.ExcludeAutomated {
+	switch scope {
+	case "human":
 		preds = append(preds, q("is_automated")+" = "+
 			b.dialect.falseLiteral)
+	case "automated":
+		preds = append(preds, q("is_automated")+" = "+
+			b.dialect.trueLiteral)
 	}
 	if len(f.Outcome) > 0 {
 		preds = append(preds,
@@ -383,7 +564,21 @@ func sessionFilterPredicates(
 		}
 		preds = append(preds, pred)
 	}
+	if f.Starred {
+		preds = append(preds,
+			"EXISTS (SELECT 1 FROM starred_sessions ss WHERE ss.session_id = "+
+				q("id")+")")
+	}
 	return preds, oneShotPred
+}
+
+// buildSessionBaseFilter returns a WHERE clause and args containing the base
+// predicates (message_count > 0, deleted_at IS NULL) plus user-facing filter
+// predicates (project, machine, agent, date, etc.) WITHOUT the relationship_type
+// exclusion. Callers that handle root-vs-child discrimination externally (e.g.
+// via buildCanonicalRootWhere) should use this instead of buildSessionFilter.
+func buildSessionBaseFilter(f SessionFilter) (string, []any) {
+	return BuildSessionBaseFilterSQL(f, SQLiteQueryDialect())
 }
 
 func inPredicate(col string, values []string, b *QueryBuilder) string {

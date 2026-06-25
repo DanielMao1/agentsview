@@ -5,7 +5,7 @@ import {
   expect,
   it,
   vi,
-} from "vitest";
+} from "vite-plus/test";
 import type {
   UsageComparison,
   UsageSummaryResponse,
@@ -250,6 +250,7 @@ describe("UsageStore session filter params", () => {
     sessions.filters.project = "proj-a";
     sessions.filters.machine = "host-a,host-b";
     sessions.filters.agent = "claude,codex";
+    sessions.filters.termination = "abandoned";
     sessions.filters.minUserMessages = 5;
     sessions.filters.includeOneShot = false;
     sessions.filters.includeAutomated = true;
@@ -262,6 +263,7 @@ describe("UsageStore session filter params", () => {
         project: "proj-a",
         machine: "host-a,host-b",
         agent: "claude,codex",
+        termination: "abandoned",
         minUserMessages: 5,
         includeOneShot: false,
         includeAutomated: true,
@@ -275,6 +277,7 @@ describe("UsageStore session filter params", () => {
         project: "proj-a",
         machine: "host-a,host-b",
         agent: "claude,codex",
+        termination: "abandoned",
         minUserMessages: 5,
         includeOneShot: false,
         includeAutomated: true,
@@ -282,7 +285,59 @@ describe("UsageStore session filter params", () => {
     );
   });
 
-  it("waits for summary before requesting follow-up usage data", async () => {
+  it("records full refresh time and clears new-data hints", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date("2026-06-15T16:00:00Z"));
+      const { usage } = await loadStore();
+
+      await usage.fetchAll();
+
+      expect(usage.lastUpdatedAt).toBe(
+        new Date("2026-06-15T16:00:00Z").getTime(),
+      );
+
+      usage.markNewData();
+      expect(usage.hasNewData).toBe(true);
+
+      vi.setSystemTime(new Date("2026-06-15T16:03:00Z"));
+      await usage.fetchAll();
+
+      expect(usage.lastUpdatedAt).toBe(
+        new Date("2026-06-15T16:03:00Z").getTime(),
+      );
+      expect(usage.hasNewData).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not mark cached partial refresh failures as current", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      vi.setSystemTime(new Date("2026-06-15T16:00:00Z"));
+      const { usage } = await loadStore();
+
+      await usage.fetchAll();
+      const previousUpdatedAt = usage.lastUpdatedAt;
+
+      usage.markNewData();
+      usageServiceMocks.getApiV1UsageTopSessions
+        .mockRejectedValueOnce(new Error("top sessions failed"));
+
+      vi.setSystemTime(new Date("2026-06-15T16:05:00Z"));
+      await usage.fetchAll();
+
+      expect(usage.lastUpdatedAt).toBe(previousUpdatedAt);
+      expect(usage.hasNewData).toBe(true);
+    } finally {
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("starts summary and top sessions together during full refresh", async () => {
     const calls: string[] = [];
     let resolveSummary:
       | ((value: unknown) => void)
@@ -318,7 +373,7 @@ describe("UsageStore session filter params", () => {
     const fetch = usage.fetchAll();
     await Promise.resolve();
 
-    expect(calls).toEqual(["summary"]);
+    expect(calls).toEqual(["summary", "topSessions"]);
     expect(usage.summary).toBeNull();
 
     resolveSummary?.({
@@ -830,6 +885,51 @@ describe("mergeUsageAndSessionUrlParams", () => {
       exclude_project: "alpha,beta,unknown",
       model: "gpt-5.5",
       machine: "host-a",
+    });
+  });
+
+  it("omits hidden session date params from usage URLs", async () => {
+    const { mergeUsageAndSessionUrlParams } = await loadStore();
+
+    expect(
+      mergeUsageAndSessionUrlParams(
+        {
+          from: "2026-02-01",
+          to: "2026-02-07",
+        },
+        {
+          date: "2026-01-15",
+          date_from: "2026-01-01",
+          date_to: "2026-01-31",
+          project: "agentsview",
+        },
+      ),
+    ).toEqual({
+      from: "2026-02-01",
+      to: "2026-02-07",
+      project: "agentsview",
+    });
+  });
+
+  it("preserves supported termination params in usage URLs", async () => {
+    const { mergeUsageAndSessionUrlParams } = await loadStore();
+
+    expect(
+      mergeUsageAndSessionUrlParams(
+        {
+          from: "2026-02-01",
+          to: "2026-02-07",
+        },
+        {
+          termination: "unclean",
+          project: "agentsview",
+        },
+      ),
+    ).toEqual({
+      from: "2026-02-01",
+      to: "2026-02-07",
+      termination: "unclean",
+      project: "agentsview",
     });
   });
 });

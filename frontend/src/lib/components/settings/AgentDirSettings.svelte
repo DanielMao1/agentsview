@@ -4,6 +4,7 @@
 
   const AGENT_LABELS: Record<string, string> = {
     claude: "Claude Code",
+    cowork: "Claude Cowork",
     codex: "Codex",
     copilot: "Copilot",
     gemini: "Gemini",
@@ -14,6 +15,7 @@
     iflow: "iFlow",
     "vscode-copilot": "VSCode Copilot",
     pi: "Pi",
+    "visualstudio-copilot": "Visual Studio Copilot",
     qwen: "Qwen Code",
     openclaw: "OpenClaw",
     qclaw: "QClaw",
@@ -23,6 +25,7 @@
     piebald: "Piebald",
     antigravity: "Antigravity",
     "antigravity-cli": "Antigravity CLI",
+    shelley: "Shelley",
   };
 </script>
 

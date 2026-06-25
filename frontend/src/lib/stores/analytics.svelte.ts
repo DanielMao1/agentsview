@@ -7,8 +7,10 @@ import type {
   SessionShapeResponse,
   VelocityResponse,
   ToolsAnalyticsResponse,
+  SkillsAnalyticsResponse,
   TopSessionsResponse,
   SignalsAnalyticsResponse,
+  AutomatedScope,
 } from "../api/types.js";
 import { AnalyticsService } from "../api/generated/index";
 import {
@@ -16,6 +18,8 @@ import {
   isAbortError,
 } from "../api/runtime.js";
 import { sessions } from "./sessions.svelte.js";
+import { perf, type PerfEntryStatus } from "./perf.svelte.js";
+import { daysAgo, today } from "../utils/dates.js";
 
 type AnalyticsParams = Parameters<
   typeof AnalyticsService.getApiV1AnalyticsSummary
@@ -33,23 +37,6 @@ export type Granularity = NonNullable<ActivityParams["granularity"]>;
 export type HeatmapMetric = NonNullable<HeatmapParams["metric"]>;
 export type TopSessionsMetric = NonNullable<TopSessionsParams["metric"]>;
 
-function localDateStr(d: Date): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
-
-function daysAgo(n: number): string {
-  const d = new Date();
-  d.setDate(d.getDate() - n);
-  return localDateStr(d);
-}
-
-function today(): string {
-  return localDateStr(new Date());
-}
-
 type Panel =
   | "summary"
   | "activity"
@@ -59,8 +46,10 @@ type Panel =
   | "sessionShape"
   | "velocity"
   | "tools"
+  | "skills"
   | "topSessions"
   | "signals";
+type FetchResult = "ok" | "error" | "aborted";
 
 class AnalyticsStore {
   from: string = $state(daysAgo(365));
@@ -77,6 +66,7 @@ class AnalyticsStore {
   minUserMessages: number = $state(0);
   includeOneShot: boolean = $state(true);
   includeAutomated: boolean = $state(false);
+  automatedScope: AutomatedScope = $state("human");
   recentlyActive: boolean = $state(false);
   selectedDow: number | null = $state(null);
   selectedHour: number | null = $state(null);
@@ -89,9 +79,12 @@ class AnalyticsStore {
   sessionShape = $state<SessionShapeResponse | null>(null);
   velocity = $state<VelocityResponse | null>(null);
   tools = $state<ToolsAnalyticsResponse | null>(null);
+  skills = $state<SkillsAnalyticsResponse | null>(null);
   topSessions = $state<TopSessionsResponse | null>(null);
   signals = $state<SignalsAnalyticsResponse | null>(null);
   topMetric: TopSessionsMetric = $state("messages");
+  lastUpdatedAt: number | null = $state(null);
+  hasNewData: boolean = $state(false);
 
   loading = $state({
     summary: false,
@@ -102,6 +95,7 @@ class AnalyticsStore {
     sessionShape: false,
     velocity: false,
     tools: false,
+    skills: false,
     topSessions: false,
     signals: false,
   });
@@ -115,6 +109,7 @@ class AnalyticsStore {
     sessionShape: false,
     velocity: false,
     tools: false,
+    skills: false,
     topSessions: false,
     signals: false,
   });
@@ -128,6 +123,7 @@ class AnalyticsStore {
     sessionShape: null,
     velocity: null,
     tools: null,
+    skills: null,
     topSessions: null,
     signals: null,
   });
@@ -141,9 +137,11 @@ class AnalyticsStore {
     sessionShape: 0,
     velocity: 0,
     tools: 0,
+    skills: 0,
     topSessions: 0,
     signals: 0,
   };
+  private fetchAllVersion = 0;
   private abortControllers: Partial<Record<Panel, AbortController>> = {};
 
   get timezone(): string {
@@ -159,7 +157,7 @@ class AnalyticsStore {
       this.termination !== "" ||
       this.minUserMessages > 0 ||
       !this.includeOneShot ||
-      this.includeAutomated ||
+      this.automatedScope !== "human" ||
       this.recentlyActive ||
       this.selectedDow !== null ||
       this.selectedHour !== null
@@ -168,6 +166,17 @@ class AnalyticsStore {
 
   get isQuerying(): boolean {
     return Object.values(this.querying).some(Boolean);
+  }
+
+  markNewData(): void {
+    if (this.lastUpdatedAt === null) return;
+    this.hasNewData = true;
+  }
+
+  private get effectiveAutomatedScope(): AutomatedScope {
+    if (!this.includeAutomated) return "human";
+    if (this.automatedScope === "human") return "all";
+    return this.automatedScope;
   }
 
   clearAllFilters() {
@@ -179,6 +188,7 @@ class AnalyticsStore {
     this.minUserMessages = 0;
     this.includeOneShot = true;
     this.includeAutomated = false;
+    this.automatedScope = "human";
     this.recentlyActive = false;
     this.selectedDow = null;
     this.selectedHour = null;
@@ -238,11 +248,18 @@ class AnalyticsStore {
 
   clearIncludeAutomated() {
     this.includeAutomated = false;
+    this.automatedScope = "human";
     sessions.filters.includeAutomated = false;
     sessions.activeSessionId = null;
     sessions.invalidateFilterCaches();
     sessions.load();
     this.fetchAll();
+  }
+
+  setAutomatedScope(scope: AutomatedScope) {
+    this.automatedScope = scope;
+    this.includeAutomated = scope !== "human";
+    this.fetchSignalsForInsights();
   }
 
   clearRecentlyActive() {
@@ -260,6 +277,7 @@ class AnalyticsStore {
     this.fetchSessionShape();
     this.fetchVelocity();
     this.fetchTools();
+    this.fetchSkills();
     this.fetchTopSessions();
     this.fetchSignals();
   }
@@ -321,6 +339,7 @@ class AnalyticsStore {
     this.fetchSessionShape();
     this.fetchVelocity();
     this.fetchTools();
+    this.fetchSkills();
     this.fetchTopSessions();
     this.fetchSignals();
   }
@@ -350,9 +369,7 @@ class AnalyticsStore {
     if (this.includeOneShot) {
       p.includeOneShot = true;
     }
-    if (this.includeAutomated) {
-      p.includeAutomated = true;
-    }
+    p.automatedScope = this.effectiveAutomatedScope;
     if (this.recentlyActive) {
       p.activeSince = new Date(
         Date.now() - 24 * 60 * 60 * 1000,
@@ -393,9 +410,7 @@ class AnalyticsStore {
       if (this.includeOneShot) {
         p.includeOneShot = true;
       }
-      if (this.includeAutomated) {
-        p.includeAutomated = true;
-      }
+      p.automatedScope = this.effectiveAutomatedScope;
       if (this.recentlyActive) {
         p.activeSince = new Date(
           Date.now() - 24 * 60 * 60 * 1000,
@@ -414,12 +429,16 @@ class AnalyticsStore {
     return this.baseParams({ includeProject, includeTime });
   }
 
+  signalEvidenceParams(): AnalyticsParams {
+    return this.filterParams();
+  }
+
   private async executeFetch<T>(
     panel: Panel,
     fetchRequest: () => Promise<T>,
     onSuccess: (data: T) => void,
     hasExistingData: () => boolean = () => false,
-  ) {
+  ): Promise<FetchResult> {
     const v = ++this.versions[panel];
     const signal = this.nextAbortSignal(panel);
     // Only show the skeleton when we don't already have data to
@@ -432,14 +451,22 @@ class AnalyticsStore {
     // a definitive result. First-load clears up front so we start
     // fresh.
     if (isFirstLoad) this.errors[panel] = null;
+    const started = performance.now();
+    let status: Extract<PerfEntryStatus, "ok" | "error" | "aborted"> = "ok";
     try {
       const data = await callGenerated(fetchRequest, signal);
       if (this.versions[panel] === v) {
         onSuccess(data);
         this.errors[panel] = null;
+        return "ok";
       }
+      return "aborted";
     } catch (e) {
-      if (isAbortError(e)) return;
+      if (isAbortError(e)) {
+        status = "aborted";
+        return "aborted";
+      }
+      status = "error";
       if (this.versions[panel] === v) {
         // On refetch failure with cached data, swallow the error so
         // existing values stay visible instead of flipping to an
@@ -451,7 +478,14 @@ class AnalyticsStore {
           console.warn(`analytics.${panel} refetch failed:`, e);
         }
       }
+      return "error";
     } finally {
+      perf.recordPanel({
+        route: "analytics",
+        name: panel,
+        durationMs: performance.now() - started,
+        status,
+      });
       this.clearAbortSignal(panel, signal);
       if (this.versions[panel] === v) {
         this.querying[panel] = false;
@@ -476,6 +510,11 @@ class AnalyticsStore {
     }
   }
 
+  private markRefreshComplete(): void {
+    this.lastUpdatedAt = Date.now();
+    this.hasNewData = false;
+  }
+
   private rollDates(): void {
     if (this.isPinned) return;
     this.from = daysAgo(this.windowDays);
@@ -483,8 +522,9 @@ class AnalyticsStore {
   }
 
   async fetchAll() {
+    const fetchVersion = ++this.fetchAllVersion;
     this.rollDates();
-    await Promise.all([
+    const results = await Promise.all([
       this.fetchSummary(),
       this.fetchActivity(),
       this.fetchHeatmap(),
@@ -493,13 +533,20 @@ class AnalyticsStore {
       this.fetchSessionShape(),
       this.fetchVelocity(),
       this.fetchTools(),
+      this.fetchSkills(),
       this.fetchTopSessions(),
       this.fetchSignals(),
     ]);
+    if (
+      fetchVersion === this.fetchAllVersion &&
+      results.every((result) => result === "ok")
+    ) {
+      this.markRefreshComplete();
+    }
   }
 
-  async fetchSummary() {
-    await this.executeFetch(
+  async fetchSummary(): Promise<FetchResult> {
+    return await this.executeFetch(
       "summary",
       () =>
         AnalyticsService.getApiV1AnalyticsSummary(
@@ -515,8 +562,8 @@ class AnalyticsStore {
   // Activity always uses the full date range so the timeline
   // stays visible as context when a date is selected (the
   // selected bar is highlighted instead of re-fetching).
-  async fetchActivity() {
-    await this.executeFetch(
+  async fetchActivity(): Promise<FetchResult> {
+    return await this.executeFetch(
       "activity",
       () =>
         AnalyticsService.getApiV1AnalyticsActivity({
@@ -530,8 +577,8 @@ class AnalyticsStore {
     );
   }
 
-  async fetchHeatmap() {
-    await this.executeFetch(
+  async fetchHeatmap(): Promise<FetchResult> {
+    return await this.executeFetch(
       "heatmap",
       () =>
         AnalyticsService.getApiV1AnalyticsHeatmap({
@@ -548,8 +595,8 @@ class AnalyticsStore {
   // Projects chart always shows all projects (no project
   // filter) so the selected project can be highlighted in
   // context rather than shown in isolation.
-  async fetchProjects() {
-    await this.executeFetch(
+  async fetchProjects(): Promise<FetchResult> {
+    return await this.executeFetch(
       "projects",
       () =>
         AnalyticsService.getApiV1AnalyticsProjects(
@@ -562,8 +609,8 @@ class AnalyticsStore {
     );
   }
 
-  async fetchHourOfWeek() {
-    await this.executeFetch(
+  async fetchHourOfWeek(): Promise<FetchResult> {
+    return await this.executeFetch(
       "hourOfWeek",
       () =>
         AnalyticsService.getApiV1AnalyticsHourOfWeek(
@@ -576,8 +623,8 @@ class AnalyticsStore {
     );
   }
 
-  async fetchSessionShape() {
-    await this.executeFetch(
+  async fetchSessionShape(): Promise<FetchResult> {
+    return await this.executeFetch(
       "sessionShape",
       () =>
         AnalyticsService.getApiV1AnalyticsSessions(
@@ -590,8 +637,8 @@ class AnalyticsStore {
     );
   }
 
-  async fetchVelocity() {
-    await this.executeFetch(
+  async fetchVelocity(): Promise<FetchResult> {
+    return await this.executeFetch(
       "velocity",
       () =>
         AnalyticsService.getApiV1AnalyticsVelocity(
@@ -604,8 +651,8 @@ class AnalyticsStore {
     );
   }
 
-  async fetchTools() {
-    await this.executeFetch(
+  async fetchTools(): Promise<FetchResult> {
+    return await this.executeFetch(
       "tools",
       () =>
         AnalyticsService.getApiV1AnalyticsTools(
@@ -618,8 +665,22 @@ class AnalyticsStore {
     );
   }
 
-  async fetchTopSessions() {
-    await this.executeFetch(
+  async fetchSkills(): Promise<FetchResult> {
+    return await this.executeFetch(
+      "skills",
+      () =>
+        AnalyticsService.getApiV1AnalyticsSkills(
+          this.filterParams(),
+        ) as unknown as Promise<SkillsAnalyticsResponse>,
+      (data) => {
+        this.skills = data;
+      },
+      () => this.skills !== null,
+    );
+  }
+
+  async fetchTopSessions(): Promise<FetchResult> {
+    return await this.executeFetch(
       "topSessions",
       () =>
         AnalyticsService.getApiV1AnalyticsTopSessions({
@@ -633,8 +694,8 @@ class AnalyticsStore {
     );
   }
 
-  async fetchSignals() {
-    await this.executeFetch(
+  async fetchSignals(): Promise<FetchResult> {
+    return await this.executeFetch(
       "signals",
       () =>
         AnalyticsService.getApiV1AnalyticsSignals(
@@ -647,28 +708,44 @@ class AnalyticsStore {
     );
   }
 
+  async fetchSignalsForInsights() {
+    this.rollDates();
+    this.selectedDate = null;
+    this.selectedDow = null;
+    this.selectedHour = null;
+    await this.fetchSignals();
+  }
+
   setTopMetric(m: TopSessionsMetric) {
     this.topMetric = m;
     this.fetchTopSessions();
   }
 
-  setDateRange(from: string, to: string) {
+  applyDateRange(from: string, to: string) {
     this.isPinned = true;
     this.from = from;
     this.to = to;
     this.selectedDate = null;
     this.selectedDow = null;
     this.selectedHour = null;
-    this.fetchAll();
   }
 
-  setRollingWindow(days: number) {
+  applyRollingWindow(days: number) {
     this.windowDays = days;
     this.isPinned = false;
     this.selectedDate = null;
     this.selectedDow = null;
     this.selectedHour = null;
     this.rollDates();
+  }
+
+  setDateRange(from: string, to: string) {
+    this.applyDateRange(from, to);
+    this.fetchAll();
+  }
+
+  setRollingWindow(days: number) {
+    this.applyRollingWindow(days);
     this.fetchAll();
   }
 
@@ -683,6 +760,7 @@ class AnalyticsStore {
     this.fetchSessionShape();
     this.fetchVelocity();
     this.fetchTools();
+    this.fetchSkills();
     this.fetchTopSessions();
     this.fetchSignals();
   }
@@ -713,6 +791,7 @@ class AnalyticsStore {
     this.fetchSessionShape();
     this.fetchVelocity();
     this.fetchTools();
+    this.fetchSkills();
     this.fetchTopSessions();
     this.fetchSignals();
   }

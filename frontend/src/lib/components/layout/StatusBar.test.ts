@@ -6,7 +6,7 @@ import {
   expect,
   it,
   vi,
-} from "vitest";
+} from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
 // @ts-ignore
 import StatusBar from "./StatusBar.svelte";
@@ -48,7 +48,7 @@ describe("StatusBar", () => {
 
     await tick();
     const syncLabel = document.querySelector(
-      ".status-right span:last-of-type",
+      ".status-right span[title]",
     );
     const expectedTitle = new Date(sync.lastSync!).toLocaleString(
       undefined,
@@ -110,6 +110,32 @@ describe("StatusBar", () => {
     sync.backendDegraded = false;
     await tick();
     expect(document.body.textContent).not.toContain("sync not ready");
+
+    unmount(component);
+  });
+
+  it("renders detailed sync progress with a hint", async () => {
+    sync.syncing = true;
+    sync.progress = {
+      phase: "rebuilding_search",
+      detail: "Rebuilding search index",
+      hint: "Rebuilding the search index may take a while on large archives.",
+      resync: true,
+      projects_total: 0,
+      projects_done: 0,
+      sessions_total: 0,
+      sessions_done: 0,
+      messages_indexed: 0,
+    };
+
+    const component = mount(StatusBar, {
+      target: document.body,
+    });
+    await tick();
+
+    const progress = document.querySelector(".sync-progress");
+    expect(progress?.textContent).toContain("Rebuilding search index");
+    expect(progress?.getAttribute("title")).toContain("may take a while");
 
     unmount(component);
   });

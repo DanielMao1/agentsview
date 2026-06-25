@@ -9,9 +9,12 @@ import {
   isAbortError,
 } from "../api/runtime.js";
 import { sessions } from "./sessions.svelte.js";
+import { perf, type PerfEntryStatus } from "./perf.svelte.js";
+import { daysAgo, today } from "../utils/dates.js";
 
 type UsageParams = Parameters<typeof UsageService.getApiV1UsageSummary>[0];
 type UsagePanel = "summary" | "comparison" | "topSessions";
+type FetchResult = "ok" | "error" | "aborted";
 type LoadedUsageSummary = {
   version: number;
   summary: UsageSummaryResponse;
@@ -77,23 +80,6 @@ function saveToggles(t: Toggles): void {
   } catch {
     // localStorage full or unavailable — silently skip.
   }
-}
-
-function localDateStr(d: Date): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
-
-function daysAgo(n: number): string {
-  const d = new Date();
-  d.setDate(d.getDate() - n);
-  return localDateStr(d);
-}
-
-function today(): string {
-  return localDateStr(new Date());
 }
 
 const DEFAULT_WINDOW_DAYS = 30;
@@ -189,6 +175,8 @@ class UsageStore {
 
   summary = $state<UsageSummaryResponse | null>(null);
   topSessions = $state<TopUsageSessionsResponse | null>(null);
+  lastUpdatedAt: number | null = $state(null);
+  hasNewData: boolean = $state(false);
 
   loading = $state({ summary: false, topSessions: false });
   querying = $state<Record<UsagePanel, boolean>>({
@@ -214,6 +202,11 @@ class UsageStore {
     return Intl.DateTimeFormat().resolvedOptions().timeZone;
   }
 
+  markNewData(): void {
+    if (this.lastUpdatedAt === null) return;
+    this.hasNewData = true;
+  }
+
   private baseParams(): UsageParams {
     const sessionFilters = sessions.filters;
     const p: UsageParams = {
@@ -223,6 +216,7 @@ class UsageStore {
       project: sessionFilters.project || undefined,
       machine: sessionFilters.machine || undefined,
       agent: sessionFilters.agent || undefined,
+      termination: sessionFilters.termination || undefined,
       minUserMessages:
         sessionFilters.minUserMessages > 0
           ? sessionFilters.minUserMessages
@@ -253,17 +247,25 @@ class UsageStore {
     return p;
   }
 
-  setDateRange(from: string, to: string) {
+  applyDateRange(from: string, to: string) {
     this.isPinned = true;
     this.from = from;
     this.to = to;
+  }
+
+  applyRollingWindow(days: number) {
+    this.windowDays = days;
+    this.isPinned = false;
+    this.rollDates();
+  }
+
+  setDateRange(from: string, to: string) {
+    this.applyDateRange(from, to);
     this.fetchAll();
   }
 
   setRollingWindow(days: number) {
-    this.windowDays = days;
-    this.isPinned = false;
-    this.rollDates();
+    this.applyRollingWindow(days);
     this.fetchAll();
   }
 
@@ -405,23 +407,36 @@ class UsageStore {
     this.invalidatePanel("topSessions");
     this.rollDates();
     saveUsageFilters(this);
-    const loadedSummary = await this.fetchSummary({
+    const params = this.baseParams();
+    const summaryPromise = this.fetchSummary({
       loadComparison: false,
+      params,
     });
-    if (fetchVersion !== this.fetchAllVersion || !loadedSummary) return;
-    await this.fetchTopSessions(loadedSummary.params);
-    if (fetchVersion !== this.fetchAllVersion) return;
-    if (loadedSummary) {
-      void this.fetchComparison(
+    const topSessionsPromise = this.fetchTopSessions(params);
+    const loadedSummary = await summaryPromise;
+    if (fetchVersion !== this.fetchAllVersion || !loadedSummary) {
+      await topSessionsPromise;
+      return;
+    }
+    const [topSessionsResult, comparisonResult] = await Promise.all([
+      topSessionsPromise,
+      this.fetchComparison(
         loadedSummary.version,
         loadedSummary.summary,
         loadedSummary.params,
-      );
+      ),
+    ]);
+    if (
+      fetchVersion === this.fetchAllVersion &&
+      topSessionsResult === "ok" &&
+      comparisonResult === "ok"
+    ) {
+      this.markRefreshComplete();
     }
   }
 
   async fetchSummary(
-    options: { loadComparison?: boolean } = {},
+    options: { loadComparison?: boolean; params?: UsageParams } = {},
   ): Promise<LoadedUsageSummary | null> {
     const loadComparison = options.loadComparison ?? true;
     const v = ++this.versions.summary;
@@ -435,8 +450,10 @@ class UsageStore {
     // Clear errors only on first load; on refetch, keep any prior
     // error state in place until we have a definitive result.
     if (isFirstLoad) this.errors.summary = null;
+    const started = performance.now();
+    let status: Extract<PerfEntryStatus, "ok" | "error" | "aborted"> = "ok";
     try {
-      const params = this.baseParams();
+      const params = options.params ?? this.baseParams();
       const data = await callGenerated(() =>
         UsageService.getApiV1UsageSummary(params),
         signal,
@@ -450,8 +467,13 @@ class UsageStore {
         }
         return loaded;
       }
+      return null;
     } catch (e) {
-      if (isAbortError(e)) return null;
+      if (isAbortError(e)) {
+        status = "aborted";
+        return null;
+      }
+      status = "error";
       if (this.versions.summary === v) {
         // On refetch failure with cached data, swallow the error so
         // existing values stay visible instead of flipping to a "--"
@@ -464,6 +486,12 @@ class UsageStore {
         }
       }
     } finally {
+      perf.recordPanel({
+        route: "usage",
+        name: "summary",
+        durationMs: performance.now() - started,
+        status,
+      });
       this.clearAbortSignal("summary", signal);
       if (this.versions.summary === v) {
         this.loading.summary = false;
@@ -476,9 +504,11 @@ class UsageStore {
     summaryVersion: number,
     summary: UsageSummaryResponse,
     params: UsageParams,
-  ) {
-    if (this.versions.summary !== summaryVersion) return;
+  ): Promise<FetchResult> {
+    if (this.versions.summary !== summaryVersion) return "aborted";
     const signal = this.nextAbortSignal("comparison");
+    const started = performance.now();
+    let status: Extract<PerfEntryStatus, "ok" | "error" | "aborted"> = "ok";
     try {
       const comparison = await callGenerated(() =>
         UsageService.getApiV1UsageComparison({
@@ -489,23 +519,40 @@ class UsageStore {
       ) as unknown as UsageComparison;
       if (this.versions.summary === summaryVersion) {
         this.summary = { ...summary, comparison };
+        return "ok";
       }
+      return "aborted";
     } catch (e) {
-      if (isAbortError(e)) return;
+      if (isAbortError(e)) {
+        status = "aborted";
+        return "aborted";
+      }
+      status = "error";
       if (this.versions.summary === summaryVersion) {
         console.warn("usage.fetchComparison failed:", e);
       }
+      return "error";
     } finally {
+      perf.recordPanel({
+        route: "usage",
+        name: "comparison",
+        durationMs: performance.now() - started,
+        status,
+      });
       this.clearAbortSignal("comparison", signal);
     }
   }
 
-  async fetchTopSessions(params: UsageParams | null = null) {
+  async fetchTopSessions(
+    params: UsageParams | null = null,
+  ): Promise<FetchResult> {
     const v = ++this.versions.topSessions;
     const signal = this.nextAbortSignal("topSessions");
     const isFirstLoad = this.topSessions === null;
     if (isFirstLoad) this.loading.topSessions = true;
     if (isFirstLoad) this.errors.topSessions = null;
+    const started = performance.now();
+    let status: Extract<PerfEntryStatus, "ok" | "error" | "aborted"> = "ok";
     try {
       const data = await callGenerated(() =>
         UsageService.getApiV1UsageTopSessions(
@@ -516,9 +563,15 @@ class UsageStore {
       if (this.versions.topSessions === v) {
         this.topSessions = data;
         this.errors.topSessions = null;
+        return "ok";
       }
+      return "aborted";
     } catch (e) {
-      if (isAbortError(e)) return;
+      if (isAbortError(e)) {
+        status = "aborted";
+        return "aborted";
+      }
+      status = "error";
       if (this.versions.topSessions === v) {
         if (this.topSessions === null) {
           this.errors.topSessions =
@@ -527,7 +580,14 @@ class UsageStore {
           console.warn("usage.fetchTopSessions refetch failed:", e);
         }
       }
+      return "error";
     } finally {
+      perf.recordPanel({
+        route: "usage",
+        name: "topSessions",
+        durationMs: performance.now() - started,
+        status,
+      });
       this.clearAbortSignal("topSessions", signal);
       if (this.versions.topSessions === v) {
         this.loading.topSessions = false;
@@ -564,6 +624,11 @@ class UsageStore {
       return true;
     }
     return false;
+  }
+
+  private markRefreshComplete(): void {
+    this.lastUpdatedAt = Date.now();
+    this.hasNewData = false;
   }
 }
 
@@ -619,6 +684,11 @@ export function buildUsageUrlParams(
 }
 
 const CSV_MERGE_URL_KEYS = new Set(["exclude_project"]);
+const SESSION_DATE_URL_KEYS = new Set([
+  "date",
+  "date_from",
+  "date_to",
+]);
 
 export function mergeUsageAndSessionUrlParams(
   usageParams: Record<string, string>,
@@ -626,6 +696,7 @@ export function mergeUsageAndSessionUrlParams(
 ): Record<string, string> {
   const params = { ...usageParams };
   for (const [key, value] of Object.entries(sessionParams)) {
+    if (SESSION_DATE_URL_KEYS.has(key)) continue;
     if (CSV_MERGE_URL_KEYS.has(key) && params[key]) {
       params[key] = joinCsvParts(params[key], value);
     } else {

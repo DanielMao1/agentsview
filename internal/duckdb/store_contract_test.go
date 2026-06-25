@@ -1,3 +1,5 @@
+//go:build !(windows && arm64)
+
 package duckdb
 
 import (
@@ -55,6 +57,22 @@ func duckContractSessionsCursorsAndMetadata(
 	require.NoError(t, err)
 	require.Equal(t, 2, next.Total)
 	require.Equal(t, []string{fixture.alphaID}, duckSessionIDs(next.Sessions))
+
+	// Sorting by a non-default column (messages, ascending by default) and its
+	// keyset cursor must render on DuckDB: beta has 1 message, alpha has 2.
+	byMsgs, err := store.ListSessions(ctx, db.SessionFilter{OrderBy: "messages", Limit: 10})
+	require.NoError(t, err)
+	require.Equal(t, []string{fixture.betaID, fixture.alphaID}, duckSessionIDs(byMsgs.Sessions))
+
+	msgPage1, err := store.ListSessions(ctx, db.SessionFilter{OrderBy: "messages", Limit: 1})
+	require.NoError(t, err)
+	require.Equal(t, []string{fixture.betaID}, duckSessionIDs(msgPage1.Sessions))
+	require.NotEmpty(t, msgPage1.NextCursor)
+	msgPage2, err := store.ListSessions(ctx, db.SessionFilter{
+		OrderBy: "messages", Limit: 1, Cursor: msgPage1.NextCursor,
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{fixture.alphaID}, duckSessionIDs(msgPage2.Sessions))
 
 	alpha, err := store.GetSession(ctx, fixture.alphaID)
 	require.NoError(t, err)
@@ -196,6 +214,13 @@ func duckContractAnalyticsTrendsAndUsage(
 	tools, err := store.GetAnalyticsTools(ctx, filter)
 	require.NoError(t, err)
 	require.Equal(t, 1, tools.TotalCalls)
+
+	skills, err := store.GetAnalyticsSkills(ctx, filter)
+	require.NoError(t, err)
+	require.Equal(t, 1, skills.TotalSkillCalls)
+	require.Equal(t, 1, skills.DistinctSkills)
+	require.NotEmpty(t, skills.BySkill)
+	require.Equal(t, "duck-search", skills.BySkill[0].SkillName)
 
 	trendTerms, err := db.ParseTrendTerms([]string{"alpha"})
 	require.NoError(t, err)
